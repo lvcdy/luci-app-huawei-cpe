@@ -1,0 +1,24 @@
+# Go
+src/huawei-cpe
+src/*.test
+*.test
+*.out
+src/vendor/
+
+# Build artifacts
+*.apk
+*.ipk
+*.o
+*.a
+bin/
+build/
+staging_dir/
+tmp/
+
+# Editor / OS
+*.swp
+*~
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -1,0 +1,36 @@
+#!/bin/sh /etc/rc.common
+# Copyright (C) 2026 luci-app-huawei-cpe authors
+# Licensed under the MIT License.
+#
+# Huawei CPE Manager daemon init script (procd)
+# - USE_PROCD=1: 崩溃自动拉起、配置变更热 reload
+# - 安装(apk)时 default_postinst 自动 enable
+
+USE_PROCD=1
+
+START=95
+STOP=10
+
+START_SERVICE_CMD=start_service
+RELOAD_SERVICE_CMD=reload_service
+
+SERVICE_NAME=huawei-cpe
+
+start_service() {
+	procd_open_instance
+	procd_set_param command /usr/sbin/huawei-cpe run
+	procd_set_param respawn 3600 5 5        # 崩溃 5 秒内拉起，1 小时内最多 5 次
+	procd_set_param file /etc/config/huawei_cpe   # 配置变更自动 reload
+	procd_set_param term_timeout 5
+	procd_set_param pidfile /var/run/huawei-cpe.pid
+	procd_close_instance
+}
+
+reload_service() {
+	# UCI 配置变更 → SIGUSR1 → daemon 重读配置
+	procd_send_signal "$SERVICE_NAME"
+}
+
+stop_service() {
+	procd_kill "$SERVICE_NAME"
+}

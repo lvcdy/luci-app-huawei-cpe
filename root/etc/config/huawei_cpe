@@ -1,0 +1,66 @@
+# Huawei CPE Manager 默认配置
+# 修改后: service huawei-cpe reload（procd 文件监听自动触发）
+
+# -----------------------------------------------------------------------
+# 主设备列表: 每个 config cpe section 是一个 CPE 设备（可多个）
+# -----------------------------------------------------------------------
+config cpe 'main'
+	option enabled '0'                     # 0=禁用 1=启用（安装后需手动启用并填写凭据）
+	option name 'Huawei CPE'               # 显示名称
+	option host '192.168.8.1'              # CPE 管理地址（默认华为 4G/5G CPE）
+	option username 'admin'
+	option password ''                     # 仅存于此与 daemon 内存，绝不写日志
+	option polling_interval '60'           # 状态轮询间隔（秒）
+	option sms_sync_interval '30'          # 短信同步间隔（秒）
+
+# -----------------------------------------------------------------------
+# 网络健康监控 (Phase 5)
+# -----------------------------------------------------------------------
+config netmon 'health'
+	option enabled '1'                     # 健康状态机开关
+	option ping_host '223.5.5.5'           # Internet 连通探测目标（默认阿里 DNS）
+	option ping_port '53'                  # 探测端口
+	option cpe_timeout '5'                 # CPE 可达探测超时（秒）
+
+# -----------------------------------------------------------------------
+# 自动恢复 (Phase 5，默认关闭)
+# -----------------------------------------------------------------------
+config recovery 'recovery'
+	option enabled '0'                     # 默认关闭，避免误触发重启
+	option max_attempts '3'                # 单次离线周期最大恢复尝试次数
+	option cooldown_minutes '30'           # 恢复冷却（分钟）
+	option reboot_on_fail '0'              # 重连仍失败时是否重启 CPE
+
+# -----------------------------------------------------------------------
+# 通知渠道 (Phase 4)
+# -----------------------------------------------------------------------
+config notify 'telegram'
+	option enabled '0'
+	option api_token ''                    # Bot Token（绝不写日志）
+	option chat_ids ''                     # 逗号分隔的 ChatID 白名单
+
+config notify 'smtp'
+	option enabled '0'
+	option host ''                         # SMTP 服务器
+	option port '465'                      # 465=SSL 587=STARTTLS
+	option user ''                         # 登录用户名
+	option password ''                     # 密码（绝不写日志）
+	option from ''                         # 发件人地址
+	option to ''                           # 收件人，逗号分隔
+	option starttls '0'                    # 1=STARTTLS 0=SSL
+
+config notify 'webhook'
+	option enabled '0'
+	option url ''                          # 接收 POST JSON 的 Webhook URL
+
+# -----------------------------------------------------------------------
+# 事件推送规则（目前用于 sms.received）
+# -----------------------------------------------------------------------
+config rules 'sms_received'
+	option telegram '0'
+	option email '0'
+	option webhook '0'
+	option filter_mode 'all'               # all | whitelist | keyword
+	option whitelist ''                    # 逗号分隔的号码白名单
+	option keywords ''                     # 逗号分隔的关键词
+	option sms_forward_secret '0'          # 0=禁止转发短信内容(默认，仅本地) 1=转发
