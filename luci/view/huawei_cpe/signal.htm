@@ -1,0 +1,227 @@
+<%#
+	Huawei CPE Manager — Signal 趋势页
+	rsrp/rsrq/sinr/rssi 趋势图（原生 canvas，无第三方框架），桶切换：
+	  h1 = 最近 1 小时原始点；d7 = 最近 7 天小时均值；d30 = 最近 30 天日均值。
+	历史数据来自 Go 侧 SQLite 历史层（/api/v1/devices/{id}/signal/history）。
+-%>
+<%+header%>
+
+<style>
+	.hcpe-toolbar { display:flex; gap:8px; align-items:center; margin-bottom:12px; flex-wrap:wrap; }
+	.hcpe-toolbar select, .hcpe-toolbar button { padding:4px 10px; }
+	.hcpe-toolbar button { cursor:pointer; }
+	.hcpe-toolbar button.active { font-weight:bold; }
+	.hcpe-chart-wrap { background:#fff; border:1px solid #ddd; border-radius:6px; padding:12px; }
+	.hcpe-chart-wrap canvas { width:100%; height:260px; display:block; }
+	.hcpe-legend { display:flex; gap:16px; margin-top:8px; font-size:12px; color:#666; }
+	.hcpe-legend span::before { content:''; display:inline-block; width:14px; height:3px; margin-right:6px; vertical-align:middle; background:currentColor; }
+	.hcpe-note { color:#999; font-size:12px; margin-top:8px; }
+	.hcpe-banner { padding:8px 12px; border-radius:4px; margin-bottom:12px; display:none; background:#fdecea; color:#a33; border:1px solid #f5c6c0; }
+</style>
+
+<h2 name="content"><%:Signal Trend%></h2>
+
+<div id="hcpe-banner" class="hcpe-banner"></div>
+
+<div class="hcpe-toolbar">
+	<label for="hcpe-device"><%:Device%>:</label>
+	<select id="hcpe-device"></select>
+	<span style="margin-left:12px"><%:Range%>:</span>
+	<button id="btn-h1" type="button">1H</button>
+	<button id="btn-d7" type="button">7D</button>
+	<button id="btn-d30" type="button">30D</button>
+	<span id="hcpe-loading" class="hcpe-note" style="display:none"><%:Loading…%></span>
+</div>
+
+<div class="hcpe-chart-wrap">
+	<canvas id="hcpe-chart" height="260"></canvas>
+	<div class="hcpe-legend">
+		<span style="color:#1565c0">RSRP (dBm)</span>
+		<span style="color:#e65100">RSRQ (dB)</span>
+		<span style="color:#2e7d32">SINR (dB)</span>
+		<span style="color:#6a1b9a">RSSI (dBm)</span>
+	</div>
+</div>
+<div id="hcpe-empty" class="hcpe-note" style="display:none"><%:No history data yet — data appears after the poller records some snapshots.%></div>
+
+<script type="text/javascript">//<![CDATA[
+(function () {
+	'use strict';
+
+	var API_BASE = "<%=url('admin', 'services', 'huawei_cpe', 'api', 'v1')%>";
+	var COLORS = { rsrp: '#1565c0', rsrq: '#e65100', sinr: '#2e7d32', rssi: '#6a1b9a' };
+	var SERIES = ['rsrp', 'rsrq', 'sinr', 'rssi'];
+	var canvas = document.getElementById('hcpe-chart');
+	var ctx = canvas.getContext('2d');
+	var curBucket = 'd7';
+	var curDevice = '';
+
+	function banner(msg) {
+		var el = document.getElementById('hcpe-banner');
+		if (msg) { el.textContent = msg; el.style.display = 'block'; }
+		else { el.style.display = 'none'; }
+	}
+
+	function getJSON(url, cb) {
+		var xhr = new XMLHttpRequest();
+		xhr.open('GET', url, true);
+		xhr.onreadystatechange = function () {
+			if (xhr.readyState !== 4) return;
+			if (xhr.status === 200) {
+				try { cb(null, JSON.parse(xhr.responseText)); return; }
+				catch (e) { cb(e); return; }
+			}
+			cb(new Error('HTTP ' + xhr.status));
+		};
+		xhr.send();
+	}
+
+	function fmtTs(ts, bucket) {
+		var d = new Date(ts * 1000);
+		function p(n) { return (n < 10 ? '0' : '') + n; }
+		if (bucket === 'h1') {
+			return p(d.getHours()) + ':' + p(d.getMinutes());
+		}
+		return (d.getMonth() + 1) + '/' + d.getDate() + (bucket === 'd7' ? ' ' + p(d.getHours()) + 'h' : '');
+	}
+
+	function setBucket(b) {
+		curBucket = b;
+		['h1', 'd7', 'd30'].forEach(function (x) {
+			document.getElementById('btn-' + x).className = (x === b) ? 'active' : '';
+		});
+		loadSeries();
+	}
+
+	function loadSeries() {
+		if (!curDevice) return;
+		document.getElementById('hcpe-loading').style.display = 'inline';
+		getJSON(API_BASE + '/devices/' + encodeURIComponent(curDevice) +
+			'/signal/history?bucket=' + curBucket, function (err, res) {
+			document.getElementById('hcpe-loading').style.display = 'none';
+			if (err) {
+				banner('<%:Failed to load history data.%>');
+				draw([]);
+				return;
+			}
+			banner(null);
+			var pts = (res && res.points) || [];
+			document.getElementById('hcpe-empty').style.display = pts.length ? 'none' : 'block';
+			draw(pts);
+		});
+	}
+
+	// 自适应高宽（应对不同 DPR 与容器宽度）。
+	function fitCanvas() {
+		var dpr = window.devicePixelRatio || 1;
+		var w = canvas.parentElement.clientWidth - 24;
+		canvas.width = Math.max(200, w) * dpr;
+		canvas.height = 260 * dpr;
+		canvas.style.height = '260px';
+		ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+		return { w: Math.max(200, w), h: 260 };
+	}
+
+	function draw(pts) {
+		var dim = fitCanvas();
+		var W = dim.w, H = dim.h;
+		var PAD = { l: 40, r: 12, t: 12, b: 28 };
+		ctx.clearRect(0, 0, W, H);
+
+		if (!pts.length) return;
+
+		// 值域（全序列合并）
+		var vmin = Infinity, vmax = -Infinity;
+		pts.forEach(function (p) {
+			SERIES.forEach(function (k) {
+				var v = Number(p[k]);
+				if (isFinite(v)) { vmin = Math.min(vmin, v); vmax = Math.max(vmax, v); }
+			});
+		});
+		if (vmin === vmax) { vmin -= 1; vmax += 1; }
+		var pad = (vmax - vmin) * 0.08;
+		vmin -= pad; vmax += pad;
+
+		var n = pts.length;
+		var xOf = function (i) { return PAD.l + (n === 1 ? 0.5 : i / (n - 1)) * (W - PAD.l - PAD.r); };
+		var yOf = function (v) { return PAD.t + (1 - (v - vmin) / (vmax - vmin)) * (H - PAD.t - PAD.b); };
+
+		// 网格 + Y 轴标签
+		ctx.strokeStyle = '#eee'; ctx.fillStyle = '#999'; ctx.font = '11px sans-serif';
+		ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+		for (var g = 0; g <= 4; g++) {
+			var gv = vmin + (vmax - vmin) * g / 4;
+			var gy = yOf(gv);
+			ctx.beginPath(); ctx.moveTo(PAD.l, gy); ctx.lineTo(W - PAD.r, gy); ctx.stroke();
+			ctx.fillText(Math.round(gv * 10) / 10, PAD.l - 6, gy);
+		}
+
+		// X 轴标签（最多 6 个）
+		ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+		var step = Math.max(1, Math.ceil(n / 6));
+		for (var xi = 0; xi < n; xi += step) {
+			ctx.fillText(fmtTs(pts[xi].ts, curBucket), xOf(xi), H - PAD.b + 6);
+		}
+
+		// 折线
+		SERIES.forEach(function (k) {
+			ctx.strokeStyle = COLORS[k]; ctx.lineWidth = 1.5; ctx.beginPath();
+			var started = false;
+			pts.forEach(function (p, i) {
+				var v = Number(p[k]);
+				if (!isFinite(v)) { started = false; return; }
+				if (!started) { ctx.moveTo(xOf(i), yOf(v)); started = true; }
+				else { ctx.lineTo(xOf(i), yOf(v)); }
+			});
+			ctx.stroke();
+		});
+	}
+
+	// 初始化设备下拉：仅纳入支持信号采集的设备（能力降级）。
+	// 快照尚未就绪（404）时按"未知能力"乐观纳入，避免误隐藏。
+	function init() {
+		getJSON(API_BASE + '/devices', function (err, res) {
+			var sel = document.getElementById('hcpe-device');
+			var devs = (!err && res && res.devices) || [];
+			if (!devs.length) {
+				banner('<%:No devices configured.%>');
+				return;
+			}
+			var pending = devs.length;
+			var eligible = [];
+			devs.forEach(function (d, idx) {
+				getJSON(API_BASE + '/devices/' + encodeURIComponent(d.id), function (e2, dd) {
+					var caps = (dd && dd.caps) || {};
+					if (e2 || caps.signal !== false) {
+						eligible.push({ idx: idx, id: d.id, name: d.name || d.id });
+					}
+					if (--pending === 0) {
+						eligible.sort(function (a, b) { return a.idx - b.idx; });
+						eligible.forEach(function (d) {
+							var opt = document.createElement('option');
+							opt.value = d.id; opt.textContent = d.name;
+							sel.appendChild(opt);
+						});
+						if (eligible.length) {
+							curDevice = eligible[0].id;
+							sel.onchange = function () { curDevice = sel.value; loadSeries(); };
+							setBucket('d7');
+						} else {
+							banner('<%:No devices with signal support.%>');
+						}
+					}
+				});
+			});
+		});
+	}
+
+	document.getElementById('btn-h1').onclick = function () { setBucket('h1'); };
+	document.getElementById('btn-d7').onclick = function () { setBucket('d7'); };
+	document.getElementById('btn-d30').onclick = function () { setBucket('d30'); };
+	window.addEventListener('resize', loadSeries);
+
+	init();
+})();
+//]]></script>
+
+<%+footer%>

@@ -1,0 +1,205 @@
+<%#
+	Huawei CPE Manager — Dashboard
+	状态卡 + 信号 + 流量概览，5s 轮询刷新（走缓存，绝不触发 CPE 请求）。
+	离线 / daemon 不可达时降级显示。
+-%>
+<%+header%>
+
+<style>
+	.hcpe-cards { display:flex; flex-wrap:wrap; gap:12px; }
+	.hcpe-card { background:#fff; border:1px solid #ddd; border-radius:6px; padding:12px 16px; min-width:260px; flex:1 1 300px; }
+	.hcpe-card h3 { margin:0 0 8px 0; font-size:14px; border-bottom:1px solid #eee; padding-bottom:6px; }
+	.hcpe-kv { width:100%; border-collapse:collapse; }
+	.hcpe-kv td { padding:3px 0; font-size:13px; vertical-align:top; }
+	.hcpe-kv td:first-child { color:#666; padding-right:12px; white-space:nowrap; }
+	.hcpe-banner { padding:8px 12px; border-radius:4px; margin-bottom:12px; display:none; }
+	.hcpe-banner.err { background:#fdecea; color:#a33; border:1px solid #f5c6c0; }
+	.hcpe-badge { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px; }
+	.hcpe-badge.on { background:#e6f4ea; color:#1e7b34; }
+	.hcpe-badge.off { background:#fdecea; color:#a33; }
+	.hcpe-badge.stale { background:#fff7e0; color:#9a7b00; }
+	.hcpe-sigbar { height:6px; border-radius:3px; background:#eee; overflow:hidden; margin-top:2px; }
+	.hcpe-sigbar > div { height:100%; background:#4caf50; }
+	.hcpe-muted { color:#999; font-size:12px; }
+</style>
+
+<h2 name="content"><%:Huawei CPE%></h2>
+
+<div id="hcpe-banner" class="hcpe-banner err"></div>
+<div id="hcpe-root" class="hcpe-cards"><span class="hcpe-muted"><%:Loading…%></span></div>
+
+<script type="text/javascript">//<![CDATA[
+(function () {
+	'use strict';
+
+	var API_BASE = "<%=url('admin', 'services', 'huawei_cpe', 'api', 'v1')%>";
+	var POLL_MS = 5000;
+	var timer = null;
+	var deviceIds = [];
+	var hosts = {}; // device id → host（来自 /devices 列表）
+	var firstLoad = true;
+
+	function $(id) { return document.getElementById(id); }
+
+	function fmtBytes(b) {
+		if (b === null || b === undefined || isNaN(b)) return '—';
+		var u = ['B', 'KB', 'MB', 'GB', 'TB'], i = 0;
+		b = Number(b);
+		while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+		return (i === 0 ? b : b.toFixed(2)) + ' ' + u[i];
+	}
+
+	function fmtRate(r) {
+		if (r === null || r === undefined || isNaN(r)) return '—';
+		return fmtBytes(r) + '/s';
+	}
+
+	function fmtTime(ts) {
+		if (!ts) return '—';
+		var d = new Date(ts * 1000);
+		function p(n) { return (n < 10 ? '0' : '') + n; }
+		return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) +
+			' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+	}
+
+	function esc(s) {
+		return String(s === null || s === undefined ? '' : s)
+			.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+	}
+
+	function banner(msg) {
+		var el = $('hcpe-banner');
+		if (msg) { el.textContent = msg; el.style.display = 'block'; }
+		else { el.style.display = 'none'; }
+	}
+
+	function getJSON(url, cb) {
+		var xhr = new XMLHttpRequest();
+		xhr.open('GET', url, true);
+		xhr.onreadystatechange = function () {
+			if (xhr.readyState !== 4) return;
+			if (xhr.status === 200) {
+				try { cb(null, JSON.parse(xhr.responseText)); return; }
+				catch (e) { cb(e); return; }
+			}
+			cb(new Error('HTTP ' + xhr.status));
+		};
+		xhr.send();
+	}
+
+	// RSRP → 0~100 质量百分比（线性映射：-120dBm=0，-70dBm=100）
+	function rsrpQuality(rsrp) {
+		if (rsrp === null || rsrp === undefined) return 0;
+		var q = ((Number(rsrp) + 120) / 50) * 100;
+		return Math.max(0, Math.min(100, q));
+	}
+
+	function kv(k, v) {
+		return '<tr><td>' + esc(k) + '</td><td>' + (v || v === 0 ? v : '—') + '</td></tr>';
+	}
+
+	function renderDevice(d) {
+		var online = !!d.online;
+		var caps = d.caps || {};
+		var sig = d.signal || {}, net = d.network || {}, tr = d.traffic || {}, info = d.info || {};
+
+		var badge = online
+			? (d.fresh ? '<span class="hcpe-badge on"><%:Online%></span>'
+				: '<span class="hcpe-badge stale"><%:Stale%></span>')
+			: '<span class="hcpe-badge off"><%:Offline%></span>';
+
+		var html = '<div class="hcpe-card"><h3>' + esc(d.device) + ' ' + badge + '</h3>' +
+			'<table class="hcpe-kv">' +
+			kv('<%:Host%>', esc(hosts[d.device])) +
+			kv('<%:Last poll%>', fmtTime(d.polled_at)) +
+			(info.DeviceName ? kv('<%:Device%>', esc(info.DeviceName)) : '') +
+			(info.SoftwareVersion ? kv('<%:Software%>', esc(info.SoftwareVersion)) : '') +
+			'</table></div>';
+
+		// 信号卡（无信号能力则隐藏 —— 能力降级）
+		if (caps.signal !== false) {
+			var q = rsrpQuality(sig.rsrp);
+			html += '<div class="hcpe-card"><h3><%:Signal%></h3><table class="hcpe-kv">' +
+				kv('RSRP', sig.rsrp !== null && sig.rsrp !== undefined ? esc(sig.rsrp) + ' dBm' : null) +
+				kv('RSRQ', sig.rsrq !== null && sig.rsrq !== undefined ? esc(sig.rsrq) + ' dB' : null) +
+				kv('SINR', sig.sinr !== null && sig.sinr !== undefined ? esc(sig.sinr) + ' dB' : null) +
+				kv('RSSI', sig.rssi !== null && sig.rssi !== undefined ? esc(sig.rssi) + ' dBm' : null) +
+				kv('<%:Mode%>', esc(sig.mode)) +
+				kv('<%:Band%>', esc(sig.band)) +
+				'</table><div class="hcpe-sigbar"><div style="width:' + q + '%"></div></div></div>';
+		}
+
+		// 网络卡
+		if (caps.cellular !== false) {
+			html += '<div class="hcpe-card"><h3><%:Network%></h3><table class="hcpe-kv">' +
+				kv('<%:Type%>', esc(net.type)) +
+				kv('<%:Provider%>', esc(net.provider_name || net.short_name)) +
+				kv('<%:Registered%>', net.registered ? '<%:Yes%>' : '<%:No%>') +
+				kv('<%:Roaming%>', net.roaming ? '<%:Yes%>' : '<%:No%>') +
+				'</table></div>';
+		}
+
+		// 流量卡
+		if (caps.traffic !== false) {
+			html += '<div class="hcpe-card"><h3><%:Traffic%></h3><table class="hcpe-kv">' +
+				kv('<%:Download rate%>', fmtRate(tr.rx_rate)) +
+				kv('<%:Upload rate%>', fmtRate(tr.tx_rate)) +
+				kv('<%:Month download%>', fmtBytes(tr.month_rx_bytes)) +
+				kv('<%:Month upload%>', fmtBytes(tr.month_tx_bytes)) +
+				kv('<%:Total download%>', fmtBytes(tr.total_rx_bytes)) +
+				kv('<%:Total upload%>', fmtBytes(tr.total_tx_bytes)) +
+				'</table></div>';
+		}
+
+		return html;
+	}
+
+	function renderDevices() {
+		var root = $('hcpe-root');
+		if (!deviceIds.length) {
+			root.innerHTML = '<span class="hcpe-muted"><%:No devices configured. Enable a device under Settings.%></span>';
+			return;
+		}
+		var pending = deviceIds.length;
+		var parts = [];
+		deviceIds.forEach(function (id) {
+			getJSON(API_BASE + '/devices/' + encodeURIComponent(id), function (err, d) {
+				if (!err && d && d.device) {
+					parts.push(renderDevice(d));
+				} else {
+					// 快照尚未就绪（轮询器未跑过）：降级占位
+					parts.push('<div class="hcpe-card"><h3>' + esc(id) +
+						' <span class="hcpe-badge off"><%:No data%></span></h3>' +
+						'<span class="hcpe-muted"><%:Waiting for first poll…%></span></div>');
+				}
+				if (--pending === 0) root.innerHTML = parts.join('') ||
+					'<span class="hcpe-muted"><%:No data%></span>';
+			});
+		});
+	}
+
+	function refresh() {
+		getJSON(API_BASE + '/devices', function (err, res) {
+			if (err) {
+				banner('<%:Daemon unavailable. Is huawei-cpe running? Check with: service huawei-cpe status%>');
+				if (firstLoad) $('hcpe-root').innerHTML = '';
+				firstLoad = false;
+				return;
+			}
+			banner(null);
+			firstLoad = false;
+			hosts = {};
+			var enabled = devs.filter(function (d) { return d.enabled !== false; });
+			enabled.forEach(function (d) { hosts[d.id] = d.host; });
+			deviceIds = enabledeviceIds = devs.filter(function (d) { return d.enabled !== false; })
+				.map(function (d) { return d.id; });
+			renderDevices();
+		});
+	}
+
+	refresh();
+	timer = setInterval(refresh, POLL_MS);
+})();
+//]]></script>
+
+<%+footer%>

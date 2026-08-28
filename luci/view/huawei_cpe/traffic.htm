@@ -1,0 +1,279 @@
+<%#
+	Huawei CPE Manager — Traffic 页
+	上：当前速率 / 月 / 总量统计卡（5s 轮询，读缓存）。
+	下：速率趋势图（原生 canvas），桶 d1/d7/d30，来自 Go 侧历史层。
+-%>
+<%+header%>
+
+<style>
+	.hcpe-banner { padding:8px 12px; border-radius:4px; margin-bottom:12px; display:none; background:#fdecea; color:#a33; border:1px solid #f5c6c0; }
+	.hcpe-cards { display:flex; flex-wrap:wrap; gap:12px; margin-bottom:16px; }
+	.hcpe-card { background:#fff; border:1px solid #ddd; border-radius:6px; padding:12px 16px; min-width:220px; flex:1 1 260px; }
+	.hcpe-card h3 { margin:0 0 8px 0; font-size:14px; border-bottom:1px solid #eee; padding-bottom:6px; }
+	.hcpe-kv { width:100%; border-collapse:collapse; }
+	.hcpe-kv td { padding:3px 0; font-size:13px; }
+	.hcpe-kv td:first-child { color:#666; padding-right:12px; white-space:nowrap; }
+	.hcpe-toolbar { display:flex; gap:8px; align-items:center; margin-bottom:12px; flex-wrap:wrap; }
+	.hcpe-toolbar select, .hcpe-toolbar button { padding:4px 10px; }
+	.hcpe-toolbar button { cursor:pointer; }
+	.hcpe-toolbar button.active { font-weight:bold; }
+	.hcpe-chart-wrap { background:#fff; border:1px solid #ddd; border-radius:6px; padding:12px; }
+	.hcpe-chart-wrap canvas { width:100%; height:260px; display:block; }
+	.hcpe-legend { display:flex; gap:16px; margin-top:8px; font-size:12px; color:#666; }
+	.hcpe-legend span::before { content:''; display:inline-block; width:14px; height:3px; margin-right:6px; vertical-align:middle; background:currentColor; }
+	.hcpe-note { color:#999; font-size:12px; margin-top:8px; }
+</style>
+
+<h2 name="content"><%:Traffic%></h2>
+
+<div id="hcpe-banner" class="hcpe-banner"></div>
+<div id="hcpe-cards" class="hcpe-cards"></div>
+
+<div class="hcpe-toolbar">
+	<label for="hcpe-device"><%:Device%>:</label>
+	<select id="hcpe-device"></select>
+	<span style="margin-left:12px"><%:Range%>:</span>
+	<button id="btn-d1" type="button">24H</button>
+	<button id="btn-d7" type="button">7D</button>
+	<button id="btn-d30" type="button">30D</button>
+	<span id="hcpe-loading" class="hcpe-note" style="display:none"><%:Loading…%></span>
+</div>
+
+<div class="hcpe-chart-wrap">
+	<canvas id="hcpe-chart" height="260"></canvas>
+	<div class="hcpe-legend">
+		<span style="color:#1565c0"><%:Download%></span>
+		<span style="color:#e65100"><%:Upload%></span>
+	</div>
+</div>
+<div id="hcpe-empty" class="hcpe-note" style="display:none"><%:No history data yet — data appears after the poller records some snapshots.%></div>
+
+<script type="text/javascript">//<![CDATA[
+(function () {
+	'use strict';
+
+	var API_BASE = "<%=url('admin', 'services', 'huawei_cpe', 'api', 'v1')%>";
+	var POLL_MS = 5000;
+	var canvas = document.getElementById('hcpe-chart');
+	var ctx = canvas.getContext('2d');
+	var curBucket = 'd1';
+	var curDevice = '';
+	var pollTimer = null;
+
+	function banner(msg) {
+		var el = document.getElementById('hcpe-banner');
+		if (msg) { el.textContent = msg; el.style.display = 'block'; }
+		else { el.style.display = 'none'; }
+	}
+
+	function getJSON(url, cb) {
+		var xhr = new XMLHttpRequest();
+		xhr.open('GET', url, true);
+		xhr.onreadystatechange = function () {
+			if (xhr.readyState !== 4) return;
+			if (xhr.status === 200) {
+				try { cb(null, JSON.parse(xhr.responseText)); return; }
+				catch (e) { cb(e); return; }
+			}
+			cb(new Error('HTTP ' + xhr.status));
+		};
+		xhr.send();
+	}
+
+	function fmtBytes(b) {
+		if (b === null || b === undefined || isNaN(b)) return '—';
+		var u = ['B', 'KB', 'MB', 'GB', 'TB'], i = 0;
+		b = Number(b);
+		while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+		return (i === 0 ? b : b.toFixed(2)) + ' ' + u[i];
+	}
+
+	function fmtRate(r) {
+		if (r === null || r === undefined || isNaN(r)) return '—';
+		return fmtBytes(r) + '/s';
+	}
+
+	function fmtTs(ts, bucket) {
+		var d = new Date(ts * 1000);
+		function p(n) { return (n < 10 ? '0' : '') + n; }
+		if (bucket === 'd1') return p(d.getHours()) + ':' + p(d.getMinutes());
+		return (d.getMonth() + 1) + '/' + d.getDate() + (bucket === 'd7' ? ' ' + p(d.getHours()) + 'h' : '');
+	}
+
+	function esc(s) {
+		return String(s === null || s === undefined ? '' : s)
+			.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+	}
+
+	function kv(k, v) {
+		return '<tr><td>' + esc(k) + '</td><td>' + (v || v === 0 ? v : '—') + '</td></tr>';
+	}
+
+	// --- 统计卡轮询 -------------------------------------------------------
+	function refreshCards() {
+		if (!curDevice) return;
+		getJSON(API_BASE + '/devices/' + encodeURIComponent(curDevice), function (err, d) {
+			var root = document.getElementById('hcpe-cards');
+			if (err || !d || !d.device) {
+				root.innerHTML = '<span class="hcpe-note"><%:Waiting for data…%></span>';
+				return;
+			}
+			banner(null);
+			var tr = d.traffic || {};
+			root.innerHTML =
+				'<div class="hcpe-card"><h3><%:Current%></h3><table class="hcpe-kv">' +
+					kv('<%:Download rate%>', fmtRate(tr.rx_rate)) +
+					kv('<%:Upload rate%>', fmtRate(tr.tx_rate)) +
+					kv('<%:Session download%>', fmtBytes(tr.current_rx_bytes)) +
+					kv('<%:Session upload%>', fmtBytes(tr.current_tx_bytes)) +
+					'</table></div>' +
+				'<div class="hcpe-card"><h3><%:This month%></h3><table class="hcpe-kv">' +
+					kv('<%:Download%>', fmtBytes(tr.month_rx_bytes)) +
+					kv('<%:Upload%>', fmtBytes(tr.month_tx_bytes)) +
+					kv('<%:Total%>', fmtBytes((tr.month_rx_bytes || 0) + (tr.month_tx_bytes || 0))) +
+					'</table></div>' +
+				'<div class="hcpe-card"><h3><%:Lifetime total%></h3><table class="hcpe-kv">' +
+					kv('<%:Download%>', fmtBytes(tr.total_rx_bytes)) +
+					kv('<%:Upload%>', fmtBytes(tr.total_tx_bytes)) +
+					kv('<%:Total%>', fmtBytes((tr.total_rx_bytes || 0) + (tr.total_tx_bytes || 0))) +
+					'</table></div>';
+		});
+	}
+
+	// --- 趋势图 -----------------------------------------------------------
+	function setBucket(b) {
+		curBucket = b;
+		['d1', 'd7', 'd30'].forEach(function (x) {
+			document.getElementById('btn-' + x).className = (x === b) ? 'active' : '';
+		});
+		loadSeries();
+	}
+
+	function loadSeries() {
+		if (!curDevice) return;
+		document.getElementById('hcpe-loading').style.display = 'inline';
+		getJSON(API_BASE + '/devices/' + encodeURIComponent(curDevice) +
+			'/traffic/history?bucket=' + curBucket, function (err, res) {
+			document.getElementById('hcpe-loading').style.display = 'none';
+			if (err) {
+				banner('<%:Failed to load history data.%>');
+				draw([]);
+				return;
+			}
+			banner(null);
+			var pts = (res && res.points) || [];
+			document.getElementById('hcpe-empty').style.display = pts.length ? 'none' : 'block';
+			draw(pts);
+		});
+	}
+
+	function fitCanvas() {
+		var dpr = window.devicePixelRatio || 1;
+		var w = canvas.parentElement.clientWidth - 24;
+		canvas.width = Math.max(200, w) * dpr;
+		canvas.height = 260 * dpr;
+		canvas.style.height = '260px';
+		ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+		return { w: Math.max(200, w), h: 260 };
+	}
+
+	function draw(pts) {
+		var dim = fitCanvas();
+		var W = dim.w, H = dim.h;
+		var PAD = { l: 56, r: 12, t: 12, b: 28 };
+		ctx.clearRect(0, 0, W, H);
+		if (!pts.length) return;
+
+		// Y 轴为速率（bytes/s），按人类可读单位取整上限
+		var vmax = 0;
+		pts.forEach(function (p) {
+			vmax = Math.max(vmax, Number(p.rx_rate) || 0, Number(p.tx_rate) || 0);
+		});
+		if (vmax <= 0) vmax = 1024;
+		vmax *= 1.1;
+
+		var n = pts.length;
+		var xOf = function (i) { return PAD.l + (n === 1 ? 0.5 : i / (n - 1)) * (W - PAD.l - PAD.r); };
+		var yOf = function (v) { return PAD.t + (1 - v / vmax) * (H - PAD.t - PAD.b); };
+
+		ctx.strokeStyle = '#eee'; ctx.fillStyle = '#999'; ctx.font = '11px sans-serif';
+		ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+		for (var g = 0; g <= 4; g++) {
+			var gv = vmax * g / 4;
+			var gy = yOf(gv);
+			ctx.beginPath(); ctx.moveTo(PAD.l, gy); ctx.lineTo(W - PAD.r, gy); ctx.stroke();
+			ctx.fillText(fmtBytes(gv) + '/s', PAD.l - 6, gy);
+		}
+
+		ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+		var step = Math.max(1, Math.ceil(n / 6));
+		for (var xi = 0; xi < n; xi += step) {
+			ctx.fillText(fmtTs(pts[xi].ts, curBucket), xOf(xi), H - PAD.b + 6);
+		}
+
+		[['rx_rate', '#1565c0'], ['tx_rate', '#e65100']].forEach(function (s) {
+			ctx.strokeStyle = s[1]; ctx.lineWidth = 1.5; ctx.beginPath();
+			var started = false;
+			pts.forEach(function (p, i) {
+				var v = Number(p[s[0]]);
+				if (!isFinite(v)) { started = false; return; }
+				if (!started) { ctx.moveTo(xOf(i), yOf(v)); started = true; }
+				else { ctx.lineTo(xOf(i), yOf(v)); }
+			});
+			ctx.stroke();
+		});
+	}
+
+	function init() {
+		getJSON(API_BASE + '/devices', function (err, res) {
+			var sel = document.getElementById('hcpe-device');
+			var devs = (!err && res && res.devices) || [];
+			if (!devs.length) {
+				banner('<%:No devices configured.%>');
+				return;
+			}
+			// 能力降级：仅纳入支持流量统计的设备；快照未就绪(404)时乐观纳入。
+			var pending = devs.length;
+			var eligible = [];
+			devs.forEach(function (d, idx) {
+				getJSON(API_BASE + '/devices/' + encodeURIComponent(d.id), function (e2, dd) {
+					var caps = (dd && dd.caps) || {};
+					if (e2 || caps.traffic !== false) {
+						eligible.push({ idx: idx, id: d.id, name: d.name || d.id });
+					}
+					if (--pending === 0) {
+						eligible.sort(function (a, b) { return a.idx - b.idx; });
+						eligible.forEach(function (d) {
+							var opt = document.createElement('option');
+							opt.value = d.id; opt.textContent = d.name;
+							sel.appendChild(opt);
+						});
+						if (eligible.length) {
+							curDevice = eligible[0].id;
+							sel.onchange = function () {
+								curDevice = sel.value;
+								refreshCards();
+								loadSeries();
+							};
+							refreshCards();
+							pollTimer = setInterval(refreshCards, POLL_MS);
+							setBucket('d1');
+						} else {
+							banner('<%:No devices with traffic statistics support.%>');
+						}
+					}
+				});
+			});
+		});
+	}
+
+	document.getElementById('btn-d1').onclick = function () { setBucket('d1'); };
+	document.getElementById('btn-d7').onclick = function () { setBucket('d7'); };
+	document.getElementById('btn-d30').onclick = function () { setBucket('d30'); };
+	window.addEventListener('resize', loadSeries);
+
+	init();
+})();
+//]]></script>
+
+<%+footer%>
