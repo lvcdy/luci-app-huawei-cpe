@@ -3,138 +3,31 @@ package device
 import (
 	"context"
 	"encoding/json"
-	"encoding/xml"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync/atomic"
 	"testing"
 
 	"huawei-cpe/internal/config"
+	"huawei-cpe/internal/testutil"
 )
 
-// ---- mock CPE server（华为 HiLink HTTP 协议）----
+// ---- mock CPE server（共享实现在 internal/testutil）----
 // 握手：GET / 返回含 csrf_token 的 HTML
 //      GET api/user/state-login → <State>-1</State>（未登录）
 //      POST api/user/login       → "OK"（校验用户名/密码）
 // 之后任意 api 请求都校验 CSRF token（绑定 Cookie 的 SessionID）。
 
-type mockCPE struct {
-	t        *testing.T
-	username string
-	token    string
-
-	loginFailOnce *atomic.Bool // 下一次 user/login 返回密码错误
-	loginCount    *atomic.Int32
-
-	stateLoggedIn *atomic.Bool // state-login 报已登录
-}
+type mockCPE struct{ *testutil.MockCPE }
 
 func newMockCPE(t *testing.T, username string) *mockCPE {
-	return &mockCPE{
-		t:             t,
-		username:      username,
-		token:         "test-csrf-token-abcdef123456",
-		loginFailOnce: &atomic.Bool{},
-		loginCount:    &atomic.Int32{},
-		stateLoggedIn: &atomic.Bool{},
-	}
+	return &mockCPE{testutil.NewMockCPE(username)}
 }
 
-// loginFailNext 让下一次 user/login 返回密码错误（108002）。
-func (m *mockCPE) loginFailNext() { m.loginFailOnce.Store(true) }
-
-func (m *mockCPE) setStateLoggedIn(v bool) { m.stateLoggedIn.Store(v) }
-
-// xmlResp 写 XML 响应。
-func (m *mockCPE) xmlResp(w http.ResponseWriter, root string, body map[string]string) {
-	var b strings.Builder
-	b.WriteString("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
-	b.WriteString("<" + root + ">")
-	for k, v := range body {
-		b.WriteString("<" + k + ">" + xmlEscape(v) + "</" + k + ">")
-	}
-	b.WriteString("</" + root + ">")
-	w.Header().Set("Content-Type", "text/xml")
-	w.WriteHeader(200)
-	_, _ = w.Write([]byte(b.String()))
-}
-
-func xmlEscape(s string) string {
-	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
-	return r.Replace(s)
-}
-
-// errResp 写带 error code 的响应。
-func (m *mockCPE) errResp(w http.ResponseWriter, code int) {
-	w.Header().Set("Content-Type", "text/xml")
-	w.WriteHeader(200)
-	body := fmt.Sprintf("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<error><code>%d</code><message></message></error>", code)
-	_, _ = w.Write([]byte(body))
-}
-
-// Handler 返回 mock 的 http.Handler。
-func (m *mockCPE) Handler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.Path
-		if path == "" || path == "/" {
-			w.Header().Set("Content-Type", "text/html")
-			_, _ = fmt.Fprintf(w, `<html><head><meta name="csrf_token" content="%s"></head><body>Huawei CPE</body></html>`, m.token)
-			return
-		}
-		if !strings.HasPrefix(path, "/api/") {
-			m.errResp(w, 125001)
-			return
-		}
-		ep := strings.TrimPrefix(path, "/api/")
-
-		// 校验 CSRF token（SDK 在请求头携带 __RequestVerificationToken）
-		reqToken := r.Header.Get("__RequestVerificationToken")
-		if reqToken != m.token {
-			m.errResp(w, 125003) // Wrong Session Token
-			return
-		}
-
-		switch ep {
-		case "user/state-login":
-			state := "-1"
-			if m.stateLoggedIn.Load() {
-				state = "0"
-			}
-			m.xmlResp(w, "response", map[string]string{
-				"State":         state,
-				"password_type": "4",
-			})
-		case "user/login":
-			m.loginCount.Add(1)
-			if m.loginFailOnce.Load() {
-				m.loginFailOnce.Store(false)
-				m.errResp(w, 108002) // Password wrong
-				return
-			}
-			var req struct {
-				Username     string `xml:"Username"`
-				Password     string `xml:"Password"`
-				PasswordType string `xml:"password_type"`
-			}
-			_ = xml.NewDecoder(r.Body).Decode(&req)
-			// SDK 对密码做 SHA256+CSRF 混淆，mock 无法逆推明文；
-			// 以"用户名匹配 + 密码非空"作为成功标准。
-			if req.Username != m.username || req.Password == "" {
-				m.errResp(w, 108001) // Username wrong
-				return
-			}
-			m.stateLoggedIn.Store(true)
-			// SDK 期望登录响应顶层就是 "OK"（<response>OK</response>）
-			w.Header().Set("Content-Type", "text/xml")
-			w.WriteHeader(200)
-			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><response>OK</response>`))
-		default:
-			m.errResp(w, 125001)
-		}
-	})
-}
+func (m *mockCPE) loginFailNext()          { m.LoginFailNext() }
+func (m *mockCPE) setStateLoggedIn(v bool) { m.SetLoggedIn(v) }
+func (m *mockCPE) logins() int32           { return m.LoginCount() }
+func (m *mockCPE) Handler() http.Handler   { return m.MockCPE }
 
 // ---- test logger ----
 
@@ -175,12 +68,12 @@ func TestDeviceConnectAndLease(t *testing.T) {
 	release()
 
 	// 再次租约应复用连接（不重新登录）
-	before := m.loginCount.Load()
+	before := m.logins()
 	_, _, err = d.Lease(ctx)
 	if err != nil {
 		t.Fatalf("second Lease failed: %v", err)
 	}
-	if got := m.loginCount.Load() - before; got != 0 {
+	if got := m.logins() - before; got != 0 {
 		t.Fatalf("expected connection reuse (0 new logins), got %d", got)
 	}
 
@@ -245,7 +138,7 @@ func TestDeviceReloginDoesFullHandshake(t *testing.T) {
 	if err != nil {
 		t.Fatalf("initial lease failed: %v", err)
 	}
-	before := m.loginCount.Load()
+	before := m.logins()
 
 	// 会话在设备端过期
 	m.setStateLoggedIn(false)
@@ -254,7 +147,7 @@ func TestDeviceReloginDoesFullHandshake(t *testing.T) {
 	if err != nil {
 		t.Fatalf("relogin failed: %v", err)
 	}
-	if got := m.loginCount.Load() - before; got == 0 {
+	if got := m.logins() - before; got == 0 {
 		t.Fatal("expected a new login after Relogin")
 	}
 }

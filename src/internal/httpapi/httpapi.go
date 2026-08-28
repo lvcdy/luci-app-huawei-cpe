@@ -184,11 +184,11 @@ func (s *Server) handleDeviceByID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"device":  id,
-		"fresh":   fresh,
+		"device":    id,
+		"fresh":     fresh,
 		"polled_at": snap.At,
-		"online":  snap.Online,
-		"info":    snap.Info,
+		"online":    snap.Online,
+		"info":      snap.Info,
 		"signal": map[string]any{
 			"rsrp": snap.Signal.RSRP,
 			"rsrq": snap.Signal.RSRQ,

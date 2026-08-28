@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -32,12 +33,18 @@ type State struct {
 	mgr     *device.Manager
 	pollers []*poller.Poller
 	cancel  context.CancelFunc // 轮询循环的取消函数
+
+	quitOnce sync.Once
+	quit     chan struct{} // 可编程退出（测试用；关闭后 Run 返回）
 }
 
 // New 创建运行状态（仅持有配置与日志，组件在 Start 中装配）。
 func New(log *slog.Logger, cfg *config.Config) *State {
-	return &State{log: log, cfg: cfg}
+	return &State{log: log, cfg: cfg, quit: make(chan struct{})}
 }
+
+// Quit 请求 Run 返回（幂等）。生产路径靠信号；测试/内嵌场景可主动调用。
+func (s *State) Quit() { s.quitOnce.Do(func() { close(s.quit) }) }
 
 // Run 启动全部组件并阻塞直到收到退出信号。
 // reloadCh 由 main 传入：procd 发送 SIGUSR1 → main 触发 reload → 本方法重读配置。
@@ -71,6 +78,10 @@ func (s *State) Run(reloadCh <-chan struct{}) error {
 		select {
 		case sig := <-sigCh:
 			s.log.Info("received signal, shutting down", slog.String("signal", sig.String()))
+			s.shutdown()
+			return nil
+		case <-s.quit:
+			s.log.Info("quit requested, shutting down")
 			s.shutdown()
 			return nil
 		case <-reloadCh:
@@ -130,7 +141,7 @@ func (s *State) reload(ctx context.Context) {
 		slog.String("after", cfg.Redacted()))
 }
 
-// shutdown 优雅停止所有组件。
+// shutdown 优雅停止所有组件（幂等）。
 func (s *State) shutdown() {
 	if s.cancel != nil {
 		s.cancel()

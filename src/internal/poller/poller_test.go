@@ -2,146 +2,33 @@ package poller
 
 import (
 	"context"
-	"encoding/xml"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"huawei-cpe/internal/config"
 	"huawei-cpe/internal/device"
+	"huawei-cpe/internal/testutil"
 )
 
-// ---- mock CPE server（复用 device_test.go 的握手协议，扩充轮询端点）----
+// ---- mock CPE server（复用 internal/testutil 共享实现）----
 
-// endpointSnap 是一个端点返回的固定 XML 快照。
-type endpointSnap struct {
-	root string            // XML 根节点名（如 response/currentplmn）
-	body map[string]string // 键值对
-}
-
-type mockCPE struct {
-	t        *testing.T
-	username string
-	token    string
-
-	loginCount atomic.Int32
-	loggedIn   atomic.Bool
-
-	mu    sync.Mutex
-	snaps map[string]endpointSnap // 端点 → 快照
-}
+type mockCPE struct{ *testutil.MockCPE }
 
 func newMockCPE(t *testing.T) *mockCPE {
-	return &mockCPE{
-		t:        t,
-		username: "admin",
-		token:    "test-csrf-token-abcdef123456",
-		snaps:    map[string]endpointSnap{},
-	}
+	return &mockCPE{testutil.NewMockCPE("admin")}
 }
 
-// setEndpoint 设置某端点的固定 XML 快照（键值对）。
+// setEndpoint 保留旧测试调用签名（转发到共享实现）。
 func (m *mockCPE) setEndpoint(ep string, root string, body map[string]string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.snaps[ep] = endpointSnap{root: root, body: body}
-}
-
-// xmlResp 输出固定 XML 快照。
-func (m *mockCPE) xmlResp(w http.ResponseWriter, root string, body map[string]string) {
-	var b strings.Builder
-	b.WriteString("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
-	b.WriteString("<" + root + ">")
-	for k, v := range body {
-		b.WriteString("<" + k + ">" + xmlEscape(v) + "</" + k + ">")
-	}
-	b.WriteString("</" + root + ">")
-	w.Header().Set("Content-Type", "text/xml")
-	w.WriteHeader(200)
-	_, _ = w.Write([]byte(b.String()))
-}
-
-func xmlEscape(s string) string {
-	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
-	return r.Replace(s)
-}
-
-// errResp 输出 error 响应（错误响应不回传新 token，与真机一致）。
-func (m *mockCPE) errResp(w http.ResponseWriter, code int) {
-	w.Header().Set("Content-Type", "text/xml")
-	w.WriteHeader(200)
-	body := fmt.Sprintf("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<error><code>%d</code><message></message></error>", code)
-	_, _ = w.Write([]byte(body))
+	m.SetEndpoint(ep, root, body)
 }
 
 // Handler 返回 mock 的 http.Handler。
-func (m *mockCPE) Handler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.Path
-		if path == "" || path == "/" {
-			w.Header().Set("Content-Type", "text/html")
-			_, _ = fmt.Fprintf(w, `<html><head><meta name="csrf_token" content="%s"></head><body>Huawei CPE</body></html>`, m.token)
-			return
-		}
-		if !strings.HasPrefix(path, "/api/") {
-			m.errResp(w, 125001)
-			return
-		}
-		ep := strings.TrimPrefix(path, "/api/")
-
-		// 真机行为：每个 API 响应头都回传 CSRF token，SDK 凭此维持登录后队列。
-		w.Header().Set("__RequestVerificationToken", m.token)
-
-		reqToken := r.Header.Get("__RequestVerificationToken")
-		if reqToken != m.token {
-			m.errResp(w, 125003)
-			return
-		}
-
-		switch ep {
-		case "user/state-login":
-			state := "-1"
-			if m.loggedIn.Load() {
-				state = "0"
-			}
-			m.xmlResp(w, "response", map[string]string{
-				"State":         state,
-				"password_type": "4",
-			})
-		case "user/login":
-			m.loginCount.Add(1)
-			var req struct {
-				Username     string `xml:"Username"`
-				Password     string `xml:"Password"`
-				PasswordType string `xml:"password_type"`
-			}
-			_ = xml.NewDecoder(r.Body).Decode(&req)
-			if req.Username != m.username || req.Password == "" {
-				m.errResp(w, 108001)
-				return
-			}
-			m.loggedIn.Store(true)
-			w.Header().Set("Content-Type", "text/xml")
-			w.WriteHeader(200)
-			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><response>OK</response>`))
-		default:
-			m.mu.Lock()
-			snap, ok := m.snaps[ep]
-			m.mu.Unlock()
-			if ok {
-				m.xmlResp(w, snap.root, snap.body)
-				return
-			}
-			// 未配置的端点：返回不支持（100002），测试能力矩阵
-			m.errResp(w, 100002)
-		}
-	})
-}
+func (m *mockCPE) Handler() http.Handler { return m.MockCPE }
 
 // ---- test logger ----
 
@@ -158,10 +45,14 @@ func formatArgs(args ...any) string {
 	return b.String()
 }
 
-func (l testLogger) Debug(msg string, args ...any) { l.t.Logf("[debug] %s%s", msg, formatArgs(args...)) }
-func (l testLogger) Info(msg string, args ...any)  { l.t.Logf("[info] %s%s", msg, formatArgs(args...)) }
-func (l testLogger) Warn(msg string, args ...any)  { l.t.Logf("[warn] %s%s", msg, formatArgs(args...)) }
-func (l testLogger) Error(msg string, args ...any) { l.t.Logf("[error] %s%s", msg, formatArgs(args...)) }
+func (l testLogger) Debug(msg string, args ...any) {
+	l.t.Logf("[debug] %s%s", msg, formatArgs(args...))
+}
+func (l testLogger) Info(msg string, args ...any) { l.t.Logf("[info] %s%s", msg, formatArgs(args...)) }
+func (l testLogger) Warn(msg string, args ...any) { l.t.Logf("[warn] %s%s", msg, formatArgs(args...)) }
+func (l testLogger) Error(msg string, args ...any) {
+	l.t.Logf("[error] %s%s", msg, formatArgs(args...))
+}
 
 // ---- helpers ----
 

@@ -38,8 +38,8 @@ type Device struct {
 	host     string              // 规范化 host（去 scheme/端口）
 	conn     *session.Connection // SDK 连接（nil = 未连接/已关闭）
 	client   *huaweilteapi.Client
-	online   bool        // 最近一次 CPE 可达且认证成功
-	lastSeen time.Time   // 最近成功交互时间
+	online   bool      // 最近一次 CPE 可达且认证成功
+	lastSeen time.Time // 最近成功交互时间
 	closed   bool
 }
 

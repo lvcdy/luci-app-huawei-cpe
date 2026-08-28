@@ -57,12 +57,12 @@ type NetworkState struct {
 // TrafficState 是 monitoring/traffic-statistics + month_statistics 的类型化解。
 // RxRate/TxRate 是差分速率（bytes/s），由 poller 根据时间差计算。
 type TrafficState struct {
-	CurrentRxBytes int64 // 当前会话累计下行字节
-	CurrentTxBytes int64 // 当前会话累计上行字节
-	TotalRxBytes   int64 // 设备总下行字节
-	TotalTxBytes   int64 // 设备总上行字节
-	MonthRxBytes   int64 // 本月下行字节（month_statistics）
-	MonthTxBytes   int64 // 本月上行字节
+	CurrentRxBytes int64   // 当前会话累计下行字节
+	CurrentTxBytes int64   // 当前会话累计上行字节
+	TotalRxBytes   int64   // 设备总下行字节
+	TotalTxBytes   int64   // 设备总上行字节
+	MonthRxBytes   int64   // 本月下行字节（month_statistics）
+	MonthTxBytes   int64   // 本月上行字节
 	RxRate         float64 // bytes/s（差分）
 	TxRate         float64 // bytes/s（差分）
 }
