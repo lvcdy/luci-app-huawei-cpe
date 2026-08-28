@@ -8,6 +8,7 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -19,7 +20,9 @@ import (
 
 	"huawei-cpe/internal/cache"
 	"huawei-cpe/internal/config"
+	"huawei-cpe/internal/db"
 	"huawei-cpe/internal/device"
+	"huawei-cpe/internal/history"
 	"huawei-cpe/internal/httpapi"
 	"huawei-cpe/internal/poller"
 )
@@ -31,6 +34,7 @@ type State struct {
 	api     *httpapi.Server
 	store   *cache.Store
 	mgr     *device.Manager
+	sqldb   *sql.DB // 历史存储（nil = 历史禁用）
 	pollers []*poller.Poller
 	cancel  context.CancelFunc // 轮询循环的取消函数
 
@@ -58,10 +62,12 @@ func (s *State) Run(reloadCh <-chan struct{}) error {
 	// 装配：设备管理器 + 快照缓存 + 轮询器。
 	s.store = cache.New()
 	s.mgr = device.NewManager(s.log, s.cfg.CPEs)
+	s.openHistory(ctx)
 	s.startPollers(ctx)
 
 	// 装配 HTTP API（仅回环 127.0.0.1），读缓存不触发 CPE。
 	s.api = httpapi.New(s.log, s.cfg, s.store, s.mgr)
+	s.api.SetDB(s.sqldb)
 
 	// 启动 API 服务（真实监听在 Start 中）。
 	if err := s.api.Start(); err != nil {
@@ -92,14 +98,66 @@ func (s *State) Run(reloadCh <-chan struct{}) error {
 }
 
 // startPollers 为全部启用设备创建并启动轮询 goroutine（单设备单循环，串行采集）。
+// 快照订阅方：内存缓存（API 读）+ 历史写入器（SQLite，可禁用）。
 func (s *State) startPollers(ctx context.Context) {
+	var sink poller.Sink = s.store
+	if s.sqldb != nil {
+		sink = fanoutSink{s.store, history.NewRecorder(s.log, s.sqldb)}
+	}
 	s.pollers = nil
 	for _, d := range s.mgr.Enabled() {
-		p := poller.New(s.log, d, s.store)
+		p := poller.New(s.log, d, sink)
 		s.pollers = append(s.pollers, p)
 		go p.Start(ctx)
 	}
 	s.log.Info("pollers started", slog.Int("count", len(s.pollers)))
+}
+
+// fanoutSink 把快照同时分发给多个订阅方（串行、同协程，无竞争）。
+type fanoutSink []poller.Sink
+
+func (f fanoutSink) PutSnapshot(id string, snap poller.Snapshot) {
+	for _, s := range f {
+		s.PutSnapshot(id, snap)
+	}
+}
+
+// openHistory 打开历史 SQLite；失败仅告警降级（历史功能关闭，核心采集不受影响）。
+// db_path 为空 = 显式禁用历史。
+func (s *State) openHistory(ctx context.Context) {
+	path := s.cfg.History.DBPath
+	if path == "" {
+		s.log.Info("history storage disabled (db_path empty)")
+		return
+	}
+	d, err := db.Open(path)
+	if err != nil {
+		s.log.Warn("history storage unavailable, continuing without it", "path", path, "err", err)
+		return
+	}
+	s.sqldb = d
+	go s.pruneLoop(ctx)
+	s.log.Info("history storage ready", "path", path, "retention_days", s.cfg.History.RetentionDays)
+}
+
+// pruneLoop 启动时清一次过期历史，之后每天清理一次（架构 §3.2）。
+func (s *State) pruneLoop(ctx context.Context) {
+	days := s.cfg.History.RetentionDays
+	if err := db.PruneHistory(ctx, s.sqldb, days); err != nil {
+		s.log.Warn("history prune", "err", err)
+	}
+	t := time.NewTicker(24 * time.Hour)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := db.PruneHistory(ctx, s.sqldb, days); err != nil {
+				s.log.Warn("history prune", "err", err)
+			}
+		}
+	}
 }
 
 // stopPollers 停止全部轮询循环并等待退出（有界等待，防止采集中的请求卡住关机）。
@@ -153,6 +211,12 @@ func (s *State) shutdown() {
 		if err := s.api.Shutdown(ctx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
 			s.log.Error("http api shutdown", "err", err)
 		}
+	}
+	if s.sqldb != nil {
+		if err := s.sqldb.Close(); err != nil {
+			s.log.Error("history db close", "err", err)
+		}
+		s.sqldb = nil
 	}
 	if s.mgr != nil {
 		s.mgr.Close()

@@ -64,3 +64,10 @@ config rules 'sms_received'
 	option whitelist ''                    # 逗号分隔的号码白名单
 	option keywords ''                     # 逗号分隔的关键词
 	option sms_forward_secret '0'          # 0=禁止转发短信内容(默认，仅本地) 1=转发
+
+# -----------------------------------------------------------------------
+# 历史存储 (信号/流量趋势, SQLite)
+# -----------------------------------------------------------------------
+config history 'history'
+	option db_path '/etc/huawei-cpe/history.db'   # 置空 '' 则禁用历史功能
+	option retention_days '30'                     # 保留天数，后台每天清理

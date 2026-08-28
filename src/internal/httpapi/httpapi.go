@@ -8,6 +8,7 @@ package httpapi
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -19,6 +20,7 @@ import (
 	"huawei-cpe/internal/cache"
 	"huawei-cpe/internal/config"
 	"huawei-cpe/internal/device"
+	"huawei-cpe/internal/history"
 )
 
 // DefaultAddr 是 API 监听地址（仅回环）。Phase 2+ 起可配置。
@@ -30,6 +32,7 @@ type Server struct {
 	cfg   *config.Config
 	store *cache.Store // 轮询快照缓存（读缓存，绝不触发 CPE 请求）
 	mgr   *device.Manager
+	db    *sql.DB // 历史存储（nil = 历史功能禁用，趋势端点返回空集）
 	srv   *http.Server
 	ln    net.Listener
 	mux   *http.ServeMux
@@ -47,6 +50,8 @@ func New(log *slog.Logger, cfg *config.Config, store *cache.Store, mgr *device.M
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/health", s.handleHealth)
 	s.mux.HandleFunc("GET /api/v1/devices", s.handleDevices)
+	s.mux.HandleFunc("GET /api/v1/devices/{id}/signal/history", s.handleSignalHistory)
+	s.mux.HandleFunc("GET /api/v1/devices/{id}/traffic/history", s.handleTrafficHistory)
 	s.mux.HandleFunc("GET /api/v1/devices/{id}", s.handleDeviceByID)
 	s.mux.HandleFunc("GET /api/v1/status", s.handleStatus)
 }
@@ -89,6 +94,9 @@ func (s *Server) SetManagers(store *cache.Store, mgr *device.Manager) {
 	s.store = store
 	s.mgr = mgr
 }
+
+// SetDB 设置历史存储（nil = 禁用历史）。
+func (s *Server) SetDB(db *sql.DB) { s.db = db }
 
 // recoverMiddleware 兜底 panic 不崩溃 daemon，返回 500（日志不泄露密钥）。
 func (s *Server) recoverMiddleware(next http.Handler) http.Handler {
@@ -227,6 +235,65 @@ func (s *Server) handleDeviceByID(w http.ResponseWriter, r *http.Request) {
 		},
 		"has_error": snap.HasError,
 	})
+}
+
+// handleSignalHistory 返回信号趋势（?bucket=h1|d7|d30，默认 d7）。
+// 历史未启用（db nil）或无数据时返回空点集（200 + empty series，前端降级）。
+func (s *Server) handleSignalHistory(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !s.knownDevice(id) {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "device not found"})
+		return
+	}
+	bucket := r.URL.Query().Get("bucket")
+	if bucket == "" {
+		bucket = "d7"
+	}
+
+	if s.db == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"device": id, "bucket": bucket, "points": []any{}})
+		return
+	}
+	pts, err := history.SignalSeries(r.Context(), s.db, id, bucket)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"device": id, "bucket": bucket, "points": pts})
+}
+
+// handleTrafficHistory 返回流量速率趋势（?bucket=d1|d7|d30，默认 d1）。
+func (s *Server) handleTrafficHistory(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !s.knownDevice(id) {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "device not found"})
+		return
+	}
+	bucket := r.URL.Query().Get("bucket")
+	if bucket == "" {
+		bucket = "d1"
+	}
+
+	if s.db == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"device": id, "bucket": bucket, "points": []any{}})
+		return
+	}
+	pts, err := history.TrafficSeries(r.Context(), s.db, id, bucket)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"device": id, "bucket": bucket, "points": pts})
+}
+
+// knownDevice 判断 id 是否在配置中（所有 {id} 端点共用）。
+func (s *Server) knownDevice(id string) bool {
+	for _, c := range s.cfg.CPEs {
+		if c.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // serverStart 记录服务启动时间（health 用）。

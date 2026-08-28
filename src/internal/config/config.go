@@ -24,9 +24,17 @@ type Config struct {
 	Notify Notify
 	// Rules 是事件推送规则（Phase 4）。
 	Rules Rules
+	// History 是历史存储配置（SQLite 信号/流量趋势）。
+	History History
 
 	// Path 是配置文件路径（非 UCI 字段，仅记录来源）。
 	Path string
+}
+
+// History 历史存储配置。DBPath 为空时历史功能整体禁用（降级运行）。
+type History struct {
+	DBPath        string // SQLite 文件路径（持久分区，勿放 /tmp）
+	RetentionDays int    // 保留天数，默认 30
 }
 
 // CPE 对应一个 config cpe section。
@@ -122,6 +130,9 @@ func Load(path string) (*Config, error) {
 			cfg.Netmon = parseNetmon(s)
 		case "recovery":
 			cfg.Recovery = parseRecovery(s)
+		case "history":
+			cfg.History.DBPath = strOpt(s, "db_path", "")
+			cfg.History.RetentionDays = intOpt(s, "retention_days", 30)
 		case "notify":
 			name := s.name
 			switch name {
@@ -180,6 +191,13 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Recovery.MaxAttempts <= 0 {
 		c.Recovery.MaxAttempts = 3
+	}
+	if c.History.DBPath == "" {
+		// /etc 是 OpenWrt 持久分区（/var → tmpfs 重启即失）。
+		c.History.DBPath = "/etc/huawei-cpe/history.db"
+	}
+	if c.History.RetentionDays <= 0 {
+		c.History.RetentionDays = 30
 	}
 	if c.Recovery.CooldownMinutes <= 0 {
 		c.Recovery.CooldownMinutes = 30
