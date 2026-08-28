@@ -97,6 +97,15 @@ func (d *Device) CredentialsAreSet() bool {
 	return d.cfg.Username != "" && d.cfg.Password != ""
 }
 
+// PollingInterval 返回配置的轮询间隔时长；未配置返回 0（上层回落默认值）。
+// 注意：只暴露时长，不暴露含凭据的完整配置。
+func (d *Device) PollingInterval() time.Duration {
+	if d.cfg.PollingInterval <= 0 {
+		return 0
+	}
+	return time.Duration(d.cfg.PollingInterval) * time.Second
+}
+
 // Snapshot 返回设备状态的内存快照（不含凭据，供 API/页面展示）。
 func (d *Device) Snapshot() Snapshot {
 	d.mu.RLock()
