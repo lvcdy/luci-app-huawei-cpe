@@ -24,6 +24,11 @@ type Logger interface {
 	Error(msg string, args ...any)
 }
 
+// Sink 接收每次轮询采集的快照（cache.Store 实现；nil = 仅保留在 Poller.Last）。
+type Sink interface {
+	PutSnapshot(id string, snap Snapshot)
+}
+
 // defaultPollInterval 是未配置轮询间隔时的缺省值（秒）。
 const defaultPollInterval = 60
 
@@ -90,7 +95,9 @@ type Snapshot struct {
 type Poller struct {
 	log  Logger
 	dev  *device.Device
+	sink Sink // 快照订阅方（可空）
 	stop chan struct{}
+	done chan struct{} // Start 返回时关闭（等待旧循环退出，防止并发采集）
 
 	mu   sync.RWMutex
 	last Snapshot // 最近一次采集快照
@@ -103,11 +110,14 @@ type Poller struct {
 
 // New 构造 Poller（不启动）。设备轮询间隔取自 cfg.PollingInterval。
 // 能力矩阵默认全部假设支持；遇 NotSupported 由 disableCap 逐项禁用（架构 §6）。
-func New(log Logger, dev *device.Device) *Poller {
+// sink 可为 nil（此时快照仅保留在 Last）。
+func New(log Logger, dev *device.Device, sink Sink) *Poller {
 	return &Poller{
 		log:  log,
 		dev:  dev,
+		sink: sink,
 		stop: make(chan struct{}),
+		done: make(chan struct{}),
 		last: Snapshot{
 			Caps: Capabilities{
 				SMS:      true,
@@ -121,6 +131,12 @@ func New(log Logger, dev *device.Device) *Poller {
 	}
 }
 
+// DeviceID 返回被采集设备的 ID。
+func (p *Poller) DeviceID() string { return p.dev.ID() }
+
+// Device 返回被采集的设备实例。
+func (p *Poller) Device() *device.Device { return p.dev }
+
 // Interval 返回该设备轮询间隔时长；未配置回落默认值。
 func (p *Poller) Interval() time.Duration {
 	if d := p.dev.PollingInterval(); d > 0 {
@@ -129,9 +145,10 @@ func (p *Poller) Interval() time.Duration {
 	return defaultPollInterval * time.Second
 }
 
-// Start 启动轮询循环并阻塞直到 ctx 取消或设备停止。
-// 首次采集立即执行，之后按 Interval 周期执行。
+// Start 启动轮询循环并阻塞直到 ctx 取消或 Stop 被调用。
+// 首次采集立即执行，之后按 Interval 周期执行。返回时 done 被关闭。
 func (p *Poller) Start(ctx context.Context) {
+	defer close(p.done)
 	p.log.Info("poller: starting", "dev", p.dev.ID(), "interval", p.Interval().String())
 	ticker := time.NewTicker(p.Interval())
 	defer ticker.Stop()
@@ -156,6 +173,11 @@ func (p *Poller) Stop() {
 	default:
 		close(p.stop)
 	}
+}
+
+// Done 返回轮询循环退出信号（Stop/cancel 生效且循环返回后关闭）。
+func (p *Poller) Done() <-chan struct{} {
+	return p.done
 }
 
 // Last 返回最近一次采集快照。
@@ -250,6 +272,11 @@ func (p *Poller) pollOnce(ctx context.Context) {
 	p.mu.Lock()
 	p.last = snap
 	p.mu.Unlock()
+
+	if p.sink != nil {
+		p.sink.PutSnapshot(p.dev.ID(), snap)
+	}
+	p.dev.SetOnline(snap.Online)
 }
 
 // fillFromStatus 解析 monitoring/status。
@@ -389,10 +416,16 @@ func disableCap(snap *Snapshot, step string) {
 // markError 在不可连接时把快照标记为离线（保留上次数据但 Online=false）。
 func (p *Poller) markError() {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.last.Online = false
 	p.last.HasError = true
 	p.last.At = time.Now()
+	snap := p.last
+	p.mu.Unlock()
+
+	p.dev.SetOnline(false)
+	if p.sink != nil {
+		p.sink.PutSnapshot(p.dev.ID(), snap)
+	}
 }
 
 // mergeInfo 合并原始信息字段（status 与 information 都可能带模型/固件）。

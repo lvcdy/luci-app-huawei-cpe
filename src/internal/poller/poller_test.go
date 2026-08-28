@@ -182,7 +182,7 @@ func newTestDevice(t *testing.T, srv *httptest.Server) *device.Device {
 func newTestPoll(t *testing.T, mock *mockCPE) (*Poller, *httptest.Server) {
 	srv := httptest.NewServer(mock.Handler())
 	dev := newTestDevice(t, srv)
-	return New(testLogger{t: t}, dev), srv
+	return New(testLogger{t: t}, dev, nil), srv
 }
 
 // ---- tests ----

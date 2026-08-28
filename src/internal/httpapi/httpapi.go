@@ -16,7 +16,9 @@ import (
 	"runtime/debug"
 	"time"
 
+	"huawei-cpe/internal/cache"
 	"huawei-cpe/internal/config"
+	"huawei-cpe/internal/device"
 )
 
 // DefaultAddr 是 API 监听地址（仅回环）。Phase 2+ 起可配置。
@@ -24,16 +26,19 @@ const DefaultAddr = "127.0.0.1:9090"
 
 // Server 是 HTTP JSON API 服务。
 type Server struct {
-	log *slog.Logger
-	cfg *config.Config
-	srv *http.Server
-	ln  net.Listener
-	mux *http.ServeMux
+	log   *slog.Logger
+	cfg   *config.Config
+	store *cache.Store // 轮询快照缓存（读缓存，绝不触发 CPE 请求）
+	mgr   *device.Manager
+	srv   *http.Server
+	ln    net.Listener
+	mux   *http.ServeMux
 }
 
 // New 创建 API server（未监听，需调用 Start）。
-func New(log *slog.Logger, cfg *config.Config) *Server {
-	s := &Server{log: log, cfg: cfg, mux: http.NewServeMux()}
+// store/mgr 可为 nil（Phase 1 早期骨架模式：仅返回配置摘要）。
+func New(log *slog.Logger, cfg *config.Config, store *cache.Store, mgr *device.Manager) *Server {
+	s := &Server{log: log, cfg: cfg, store: store, mgr: mgr, mux: http.NewServeMux()}
 	s.routes()
 	return s
 }
@@ -42,6 +47,7 @@ func New(log *slog.Logger, cfg *config.Config) *Server {
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/health", s.handleHealth)
 	s.mux.HandleFunc("GET /api/v1/devices", s.handleDevices)
+	s.mux.HandleFunc("GET /api/v1/devices/{id}", s.handleDeviceByID)
 	s.mux.HandleFunc("GET /api/v1/status", s.handleStatus)
 }
 
@@ -78,6 +84,12 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // UpdateConfig 热更新配置引用（reload 时调用）。
 func (s *Server) UpdateConfig(cfg *config.Config) { s.cfg = cfg }
 
+// SetManagers 热更新缓存与设备管理器引用（reload 时调用）。
+func (s *Server) SetManagers(store *cache.Store, mgr *device.Manager) {
+	s.store = store
+	s.mgr = mgr
+}
+
 // recoverMiddleware 兜底 panic 不崩溃 daemon，返回 500（日志不泄露密钥）。
 func (s *Server) recoverMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -106,25 +118,115 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	// Phase 1：仅配置摘要（脱敏）；P1.6+ 提供真实状态缓存。
 	writeJSON(w, http.StatusOK, map[string]any{
 		"state": "running",
 		"cpes":  redactedCPEs(s.cfg),
 	})
 }
 
+// handleDevices 返回全部设备的脱敏列表 + 最近快照摘要（读缓存，不触发 CPE）。
 func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
 	devs := make([]map[string]any, 0, len(s.cfg.CPEs))
 	for _, c := range s.cfg.CPEs {
-		devs = append(devs, map[string]any{
+		e := map[string]any{
 			"id":      c.ID,
 			"name":    c.Name,
 			"host":    c.Host,
 			"enabled": c.Enabled,
 			// 绝不返回 password/username
-		})
+		}
+		if s.store != nil {
+			if snap, fresh, ok := s.store.Get(c.ID); ok {
+				e["online"] = snap.Online
+				e["fresh"] = fresh
+				e["polled_at"] = snap.At
+				e["signal_rsrp"] = snap.Signal.RSRP
+			}
+		}
+		devs = append(devs, e)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"devices": devs})
+}
+
+// handleDeviceByID 返回单设备完整快照（读缓存，不触发 CPE）。
+func (s *Server) handleDeviceByID(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing device id"})
+		return
+	}
+
+	// 设备必须在配置中（否则 404）
+	var found bool
+	for _, c := range s.cfg.CPEs {
+		if c.ID == id {
+			found = true
+			break
+		}
+	}
+	if !found {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "device not found"})
+		return
+	}
+
+	if s.store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "cache not ready"})
+		return
+	}
+
+	snap, fresh, ok := s.store.Get(id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]any{
+			"error":  "no snapshot yet (poller not run)",
+			"device": id,
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"device":  id,
+		"fresh":   fresh,
+		"polled_at": snap.At,
+		"online":  snap.Online,
+		"info":    snap.Info,
+		"signal": map[string]any{
+			"rsrp": snap.Signal.RSRP,
+			"rsrq": snap.Signal.RSRQ,
+			"sinr": snap.Signal.SINR,
+			"rssi": snap.Signal.RSSI,
+			"mode": snap.Signal.Mode,
+			"band": snap.Signal.Band,
+			"plmn": snap.Signal.PLMN,
+			"pci":  snap.Signal.PCI,
+		},
+		"network": map[string]any{
+			"type":          snap.Network.CurrentNetworkType,
+			"domain":        snap.Network.CurrentServiceDomain,
+			"roaming":       snap.Network.Roaming,
+			"registered":    snap.Network.RegisteredPlmn,
+			"provider_name": snap.Network.ProviderName,
+			"short_name":    snap.Network.ShortName,
+		},
+		"traffic": map[string]any{
+			"current_rx_bytes": snap.Traffic.CurrentRxBytes,
+			"current_tx_bytes": snap.Traffic.CurrentTxBytes,
+			"total_rx_bytes":   snap.Traffic.TotalRxBytes,
+			"total_tx_bytes":   snap.Traffic.TotalTxBytes,
+			"month_rx_bytes":   snap.Traffic.MonthRxBytes,
+			"month_tx_bytes":   snap.Traffic.MonthTxBytes,
+			"rx_rate":          snap.Traffic.RxRate,
+			"tx_rate":          snap.Traffic.TxRate,
+		},
+		"caps": map[string]any{
+			"sms":      snap.Caps.SMS,
+			"signal":   snap.Caps.Signal,
+			"traffic":  snap.Caps.Traffic,
+			"cellular": snap.Caps.Cellular,
+			"cellinfo": snap.Caps.CellInfo,
+			"reboot":   snap.Caps.Reboot,
+		},
+		"has_error": snap.HasError,
+	})
 }
 
 // serverStart 记录服务启动时间（health 用）。
