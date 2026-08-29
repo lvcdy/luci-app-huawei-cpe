@@ -111,8 +111,20 @@ const (
 type SmsInserter struct{}
 
 // Insert 将一条从 CPE 拉到的短信写入本地库。
-// 唯一键 (device_id, cpe_index) 冲突时静默忽略（INSERT OR IGNORE）。
+// 步骤：
+//  1. UPDATE 镜像刷新：CPE 侧读状态等变化同步到已存在的本地行（幂等）；
+//  2. INSERT OR IGNORE 去重插入：唯一键 (device_id, cpe_index) 冲突时静默忽略。
+// 返回 (inserted bool, err)：inserted=true 表示本次为新增行；
+// 已存在（重复同步，仅镜像刷新）时返回 false —— 不属于错误。
 func (SmsInserter) Insert(ctx context.Context, d *sql.DB, deviceID string, sms SmsRow) (bool, error) {
+	// 镜像刷新：CPE 侧状态（如已读 status）可能已在手机上变化，同步到本地行。
+	// 仅刷新 status（read_local 是本地标读权威，不受 CPE 覆盖）。
+	if _, err := d.ExecContext(ctx,
+		`UPDATE sms SET status = ? WHERE device_id = ? AND cpe_index = ?`,
+		sms.Status, deviceID, sms.CpeIndex); err != nil {
+		return false, fmt.Errorf("update sms status: %w", err)
+	}
+
 	res, err := d.ExecContext(ctx,
 		`INSERT OR IGNORE INTO sms (device_id, cpe_index, phone, content, status, received_at) VALUES (?, ?, ?, ?, ?, ?)`,
 		deviceID, sms.CpeIndex, sms.Phone, sms.Content, sms.Status, sms.ReceivedAt)
@@ -133,4 +145,116 @@ type SmsRow struct {
 	Content    string
 	Status     int    // enums.SmsStatus 数值
 	ReceivedAt int64  // unix 秒
+}
+
+// SmsMessage 是 API 返回的一条短信（本地 id + 完整字段）。
+// LocalID 是本地自增主键（API 路由用）；Unread 由 status 与 read_local 综合。
+type SmsMessage struct {
+	ID         int64  `json:"id"`
+	CpeIndex   int    `json:"cpe_index"`
+	Phone      string `json:"phone"`
+	Content    string `json:"content"`
+	Status     int    `json:"status"`
+	ReceivedAt int64  `json:"received_at"`
+	ReadLocal  int    `json:"read_local"`
+	Unread     bool   `json:"unread"`
+}
+
+// ListSms 返回设备的短信列表（按 received_at 倒序）。
+// filter: "unread" 仅未读；其它值（含空）返回全部。
+// unread 判定：status=0（CPE 侧未读）**且** read_local=0（本地未读）才未读；
+// 任一侧为已读（CPE 手机读过 → status=1；LuCI 标读 → read_local=1）即已读。
+// search 非空时按 phone/content LIKE 过滤（% 转义由调用方处理）。
+func ListSms(ctx context.Context, d *sql.DB, deviceID, filter, search string) ([]SmsMessage, error) {
+	q := `SELECT id, cpe_index, phone, content, status, received_at, read_local, unread
+	      FROM (
+	        SELECT *, (status = 0 AND read_local = 0) AS unread
+	        FROM sms WHERE device_id = ?
+	      ) WHERE 1=1`
+	args := []any{deviceID}
+	if filter == "unread" {
+		q += ` AND unread = 1`
+	}
+	if search != "" {
+		q += ` AND (phone LIKE ? OR content LIKE ?)`
+		like := "%" + search + "%"
+		args = append(args, like, like)
+	}
+	q += ` ORDER BY received_at DESC, id DESC`
+
+	rows, err := d.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list sms: %w", err)
+	}
+	defer rows.Close()
+
+	out := []SmsMessage{}
+	for rows.Next() {
+		var m SmsMessage
+		if err := rows.Scan(&m.ID, &m.CpeIndex, &m.Phone, &m.Content,
+			&m.Status, &m.ReceivedAt, &m.ReadLocal, &m.Unread); err != nil {
+			return nil, fmt.Errorf("scan sms: %w", err)
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// CountUnreadSms 返回设备未读短信数（与 ListSms 相同的未读口径）。
+func CountUnreadSms(ctx context.Context, d *sql.DB, deviceID string) (int, error) {
+	var n int
+	err := d.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sms WHERE device_id = ? AND status = 0 AND read_local = 0`,
+		deviceID).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count unread sms: %w", err)
+	}
+	return n, nil
+}
+
+// GetSms 按本地 id 取单条短信（含 device_id 归属校验）。
+// 不存在返回 (zero, sql.ErrNoRows)。
+func GetSms(ctx context.Context, d *sql.DB, deviceID string, localID int64) (SmsMessage, error) {
+	var m SmsMessage
+	err := d.QueryRowContext(ctx,
+		`SELECT id, cpe_index, phone, content, status, received_at, read_local,
+		        (status = 0 AND read_local = 0) AS unread
+		 FROM sms WHERE id = ? AND device_id = ?`,
+		localID, deviceID).
+		Scan(&m.ID, &m.CpeIndex, &m.Phone, &m.Content,
+			&m.Status, &m.ReceivedAt, &m.ReadLocal, &m.Unread)
+	if err != nil {
+		return m, err // sql.ErrNoRows 原样返回
+	}
+	return m, nil
+}
+
+// MarkSmsRead 置已读标记（幂等；不存在返回 (false, nil)）。
+// 同时置 status=1 与 read_local=1：status 维持 CPE 侧镜像一致（CPE SetRead 成功后
+// CPE 自身也置 status=1），read_local 为本地即时标记（不等下次同步）。
+func MarkSmsRead(ctx context.Context, d *sql.DB, deviceID string, localID int64) (bool, error) {
+	res, err := d.ExecContext(ctx,
+		`UPDATE sms SET status = 1, read_local = 1 WHERE id = ? AND device_id = ?`, localID, deviceID)
+	if err != nil {
+		return false, fmt.Errorf("mark sms read: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("mark sms read rows: %w", err)
+	}
+	return n > 0, nil
+}
+
+// DeleteSmsLocal 删除本地短信行（幂等；不存在返回 (false, nil)）。
+func DeleteSmsLocal(ctx context.Context, d *sql.DB, deviceID string, localID int64) (bool, error) {
+	res, err := d.ExecContext(ctx,
+		`DELETE FROM sms WHERE id = ? AND device_id = ?`, localID, deviceID)
+	if err != nil {
+		return false, fmt.Errorf("delete sms: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("delete sms rows: %w", err)
+	}
+	return n > 0, nil
 }

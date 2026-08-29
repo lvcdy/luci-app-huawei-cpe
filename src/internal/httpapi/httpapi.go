@@ -19,6 +19,7 @@ import (
 
 	"huawei-cpe/internal/cache"
 	"huawei-cpe/internal/config"
+	"huawei-cpe/internal/db"
 	"huawei-cpe/internal/device"
 	"huawei-cpe/internal/history"
 )
@@ -52,6 +53,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/devices", s.handleDevices)
 	s.mux.HandleFunc("GET /api/v1/devices/{id}/signal/history", s.handleSignalHistory)
 	s.mux.HandleFunc("GET /api/v1/devices/{id}/traffic/history", s.handleTrafficHistory)
+	s.mux.HandleFunc("GET /api/v1/devices/{id}/sms", s.handleSmsList)
+	s.mux.HandleFunc("POST /api/v1/devices/{id}/sms/{sid}/read", s.handleSmsMarkRead)
+	s.mux.HandleFunc("DELETE /api/v1/devices/{id}/sms/{sid}", s.handleSmsDelete)
 	s.mux.HandleFunc("GET /api/v1/devices/{id}", s.handleDeviceByID)
 	s.mux.HandleFunc("GET /api/v1/status", s.handleStatus)
 }
@@ -294,6 +298,160 @@ func (s *Server) knownDevice(id string) bool {
 		}
 	}
 	return false
+}
+
+// handleSmsList 返回短信列表 + 未读计数。
+//   - ?filter=all|unread（默认 all）
+//   - ?search=<关键字>（匹配 phone/content）
+//
+// 短信正文在此端点返回给前端用于展示（属正常功能）；绝不进日志/错误链。
+// db nil（历史未启用）时返回 200 空集（前端降级，与趋势端点一致）。
+func (s *Server) handleSmsList(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !s.knownDevice(id) {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "device not found"})
+		return
+	}
+	if s.db == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"device": id, "messages": []any{}, "unread_count": 0,
+		})
+		return
+	}
+
+	filter := r.URL.Query().Get("filter")
+	if filter == "" {
+		filter = "all"
+	}
+	msgs, err := db.ListSms(r.Context(), s.db, id, filter, r.URL.Query().Get("search"))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to list sms"})
+		return
+	}
+	unread, err := db.CountUnreadSms(r.Context(), s.db, id)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to count unread sms"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"device": id, "filter": filter, "messages": msgs, "unread_count": unread,
+	})
+}
+
+// handleSmsMarkRead 置本地已读（POST）。设备离线/不支持时返回错误，本地不变。
+// 流程：本地行 → CPE SetRead(cpe_index) 成功 → 本地 MarkSmsRead → 200。
+func (s *Server) handleSmsMarkRead(w http.ResponseWriter, r *http.Request) {
+	id, sid := r.PathValue("id"), r.PathValue("sid")
+	if !s.knownDevice(id) {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "device not found"})
+		return
+	}
+	localID, err := parseSmsID(sid)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if s.db == nil {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "history db disabled"})
+		return
+	}
+
+	row, err := db.GetSms(r.Context(), s.db, id, localID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "sms not found"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to load sms"})
+		return
+	}
+
+	d := s.mgr.Get(id)
+	if d == nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "device manager not ready"})
+		return
+	}
+	client, release, err := d.Lease(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "device unreachable"})
+		return
+	}
+	defer release() // 必须配对，否则锁泄漏（死锁）
+	if _, err := client.Sms.SetRead(row.CpeIndex); err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "cpe set-read failed"})
+		return
+	}
+	if _, err := db.MarkSmsRead(r.Context(), s.db, id, localID); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to mark read"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"id": sid, "device": id, "read": true})
+}
+
+// handleSmsDelete 删除短信（DELETE）。CPE 失败时返回错误，本地不变（双向一致）。
+func (s *Server) handleSmsDelete(w http.ResponseWriter, r *http.Request) {
+	id, sid := r.PathValue("id"), r.PathValue("sid")
+	if !s.knownDevice(id) {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "device not found"})
+		return
+	}
+	localID, err := parseSmsID(sid)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if s.db == nil {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "history db disabled"})
+		return
+	}
+
+	row, err := db.GetSms(r.Context(), s.db, id, localID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "sms not found"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to load sms"})
+		return
+	}
+
+	d := s.mgr.Get(id)
+	if d == nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "device manager not ready"})
+		return
+	}
+	client, release, err := d.Lease(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "device unreachable"})
+		return
+	}
+	defer release() // 必须配对，否则锁泄漏（死锁）
+	if _, err := client.Sms.DeleteSms(row.CpeIndex); err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "cpe delete failed"})
+		return
+	}
+	if _, err := db.DeleteSmsLocal(r.Context(), s.db, id, localID); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to delete sms"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"id": sid, "device": id, "deleted": true})
+}
+
+// parseSmsID 解析路径中的本地短信 id。
+func parseSmsID(s string) (int64, error) {
+	var n int64
+	if s == "" {
+		return 0, fmt.Errorf("missing sms id")
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, fmt.Errorf("invalid sms id")
+		}
+	}
+	for _, c := range s {
+		n = n*10 + int64(c-'0')
+	}
+	return n, nil
 }
 
 // serverStart 记录服务启动时间（health 用）。
