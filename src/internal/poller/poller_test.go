@@ -18,7 +18,7 @@ import (
 
 type mockCPE struct{ *testutil.MockCPE }
 
-func newMockCPE(t *testing.T) *mockCPE {
+func newMockCPE(*testing.T) *mockCPE {
 	return &mockCPE{testutil.NewMockCPE("admin")}
 }
 

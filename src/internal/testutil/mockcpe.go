@@ -181,11 +181,21 @@ func (m *MockCPE) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (m *MockCPE) xmlResp(w http.ResponseWriter, root string, body map[string]string) {
 	var b strings.Builder
 	b.WriteString("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
-	b.WriteString("<" + root + ">")
+	b.WriteByte('<')
+	b.WriteString(root)
+	b.WriteByte('>')
 	for k, v := range body {
-		b.WriteString("<" + k + ">" + xmlEscape(v) + "</" + k + ">")
+		b.WriteByte('<')
+		b.WriteString(k)
+		b.WriteByte('>')
+		b.WriteString(xmlEscape(v))
+		b.WriteString("</")
+		b.WriteString(k)
+		b.WriteByte('>')
 	}
-	b.WriteString("</" + root + ">")
+	b.WriteString("</")
+	b.WriteString(root)
+	b.WriteByte('>')
 	w.Header().Set("Content-Type", "text/xml")
 	w.WriteHeader(200)
 	_, _ = w.Write([]byte(b.String()))
