@@ -1,5 +1,7 @@
-# 打包：用官方 OpenWrt SDK 交叉编译本项目，产出 apk 安装包（OpenWrt 24.10 使用 apk 包管理器）
-#   - 默认目标: 24.10.0 / ramips-mt7621 (mipsel_24kc)，可在 workflow_dispatch 时选择
+# 打包：用官方 OpenWrt SDK 交叉编译本项目，产出 apk 安装包
+#   - 默认目标: airoha/an7581（snapshot SDK，gcc-14），可在 workflow_dispatch 时选择
+#   - version=snapshot 走 downloads.openwrt.org/snapshots/，否则走 releases/<version>/
+#   - SDK 压缩包名/校验和从 sha256sums 动态提取（gcc 版本随平台与版本不同，不硬编码）
 #   - 将包输出目录（bin/）上传为 CI artifacts；打 tag 时自动发布到 GitHub Release
 name: package
 
@@ -13,9 +15,13 @@ on:
         required: false
         default: ''
       target:
-        description: 'OpenWrt SDK 目标架构'
+        description: 'OpenWrt SDK 目标架构（如 airoha/an7581、ramips/mt7621、ipq40xx/generic）'
         required: false
-        default: 'ramips/mt7621'
+        default: 'airoha/an7581'
+      version:
+        description: 'SDK 版本：snapshot（最新快照）或固定发行版号（如 24.10.0、23.05.5）'
+        required: false
+        default: 'snapshot'
 
 # 允许 tag push 时创建/更新 Release（GITHUB_TOKEN 的 Contents: write 权限）
 permissions:
@@ -30,7 +36,6 @@ defaults:
     shell: bash
 
 env:
-  OPENWRT_RELEASE: '24.10.0'
   # SDK 下载后源包默认在 scripts/ 里解出的软件包会被覆盖，这里统一路径
   SDK_ROOT: ${{ github.workspace }}/sdk
   PKG_DIR: ${{ github.workspace }}/sdk/package/luci-app-huawei-cpe
@@ -46,9 +51,11 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          - ramips/mt7621
-          # - ipq40xx/generic   # 解禁即多架构打包
-          # - mediatek/filogic  # 解禁即多架构打包
+          - airoha/an7581
+          # 多架构打包：
+          # - ramips/mt7621
+          # - ipq40xx/generic
+          # - mediatek/filogic
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -69,38 +76,47 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$HOME/.cache/openwrt-sdk"
-          arch="${{ matrix.target }}"
-          # target → 目录名（如 ramips/mt7621 → ramips-mt7621）
-          dir="${arch//\//-}"
-          url="https://downloads.openwrt.org/releases/${OPENWRT_RELEASE}/targets/${arch}/openwrt-sdk-${OPENWRT_RELEASE}-${dir}_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
-          sha=$(curl -fsSL "https://downloads.openwrt.org/releases/${OPENWRT_RELEASE}/targets/${arch}/sha256sums" \
-            | awk -v p="openwrt-sdk-${OPENWRT_RELEASE}-${dir}_gcc-13.3.0_musl.Linux-x86_64.tar.zst" '$2 == "*" p { print $1; exit }')
-          [ -n "$sha" ] || { echo "未找到 SDK 校验和"; exit 1; }
-          echo "SDK_URL=$url"
+          target="${{ matrix.target }}"
+          version="${{ inputs.version }}"
+          [ -n "$version" ] || version="snapshot"
+          echo "SDK_VERSION=$version" >> "$GITHUB_ENV"
+          # target → 目录名（如 airoha/an7581 → airoha-an7581）
+          if [ "$version" = "snapshot" ]; then
+            base="https://downloads.openwrt.org/snapshots/targets/${target}"
+          else
+            base="https://downloads.openwrt.org/releases/${version}/targets/${target}"
+          fi
+          # 从 sha256sums 动态提取 SDK 压缩包名（gcc 版本随平台/版本不同，不硬编码）
+          tarball=$(curl -fsSL "${base}/sha256sums" \
+            | grep -oE 'openwrt-sdk-[^ ]+\.Linux-x86_64\.tar\.zst' | head -n1)
+          [ -n "$tarball" ] || { echo "::error::sha256sums 中未找到 SDK 压缩包名（${base}）"; exit 1; }
+          sha=$(curl -fsSL "${base}/sha256sums" | grep -F "$tarball" | awk '{print $1}' | head -n1)
+          [ -n "$sha" ] || { echo "::error::未找到 SDK 校验和"; exit 1; }
+          echo "SDK_TARBALL=$tarball"
+          echo "SDK_TARBALL=$tarball" >> "$GITHUB_ENV"
+          echo "SDK_URL=${base}/${tarball}"
+          echo "SDK_URL=${base}/${tarball}" >> "$GITHUB_ENV"
           echo "SDK_SHA256=$sha"
-          echo "SDK_URL=$url" >> "$GITHUB_ENV"
           echo "SDK_SHA256=$sha" >> "$GITHUB_ENV"
 
       - name: Cache SDK tarball
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/.sdk-cache
-          key: openwrt-sdk-${{ matrix.target }}-${{ env.OPENWRT_RELEASE }}
+          key: openwrt-sdk-${{ matrix.target }}-${{ inputs.version || 'snapshot' }}
 
       - name: Extract SDK
         run: |
           set -euo pipefail
-          arch="${{ matrix.target }}"
-          dir="${arch//\//-}"
-          tarball="openwrt-sdk-${OPENWRT_RELEASE}-${dir}_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
+          dir="${SDK_TARBALL%.*}"; dir="${dir%.*}"; dir="${dir#openwrt-sdk-}"  # 仅用于日志显示
           # cache 未命中时目录不存在，先建目录
           mkdir -p .sdk-cache
-          if [ ! -f ".sdk-cache/${tarball}" ]; then
-            curl -fL --retry 3 --retry-all-errors "$SDK_URL" -o ".sdk-cache/${tarball}"
+          if [ ! -f ".sdk-cache/${SDK_TARBALL}" ]; then
+            curl -fL --retry 3 --retry-all-errors "$SDK_URL" -o ".sdk-cache/${SDK_TARBALL}"
           fi
-          echo "${SDK_SHA256}  .sdk-cache/${tarball}" | sha256sum -c -
+          echo "${SDK_SHA256}  .sdk-cache/${SDK_TARBALL}" | sha256sum -c -
           mkdir -p sdk
-          tar --zstd -xf ".sdk-cache/${tarball}" -C sdk --strip-components=1
+          tar --zstd -xf ".sdk-cache/${SDK_TARBALL}" -C sdk --strip-components=1
           ls sdk
 
       # ---------- feeds：只需要 packages（golang/jq）与 luci（luci-base） ----------
@@ -109,10 +125,12 @@ jobs:
         run: |
           ./scripts/feeds update packages luci
 
-      - name: Install feed packages
+      - name: Install feed packages (all)
         working-directory: sdk
         run: |
-          ./scripts/feeds install golang jq luci-base
+          # 全量安装 packages/luci 两个 feed 的包，保证依赖树（如 liblua/lucihttp 等）可完整解析，
+          # 避免出现 lucihttp 编译时缺 lua.h 之类的依赖缺失错误
+          ./scripts/feeds install -a
 
       # ---------- Makefile 引用 $(TOPDIR)/../toolchain/golang/golang-package.mk ----------
       - name: Link golang toolchain (for Makefile include path)
