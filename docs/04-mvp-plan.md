@@ -53,13 +53,14 @@ M7 打磨: 错误处理/退避/测试/文档/打包构建                       
 |---|---|---|---|
 | P3.1 | DB schema + 迁移 | `internal/db` + `sms` 表 | ✅ `sqlite3` 查看表结构正确 |
 | P3.2 | SMS 同步循环 | `internal/sms`：`GetMessages`→写库→去重 `UNIQUE(device_id,cpe_index)` | ✅ `go test ./internal/sms/` 绿：重复同步不重复入库 |
-| P3.3 | 已读/删除（双向） | API POST read / DELETE → CPE `SetRead/DeleteSms` + 本地 | 模拟 CPE 验证回写 |
-| P3.4 | SMS 列表 UI | `sms.htm`：全部/未读/搜索/号码筛选/排序/未读计数 | 模拟数据交互通过 |
-| P3.5 | 发送（可选） | `SendSms` 接入 | 真机可选 |
-| P3.6 | UI 设计（pen.dev） | 使用 pen.dev 设计 UI（草案，先出方案不落代码） | ⏸ 待用户审阅后再应用（暂不实施，不进入 M4 验收） |
+| P3.3 | 已读/删除（双向） | API POST read / DELETE → CPE `SetRead/DeleteSms` + 本地 | ✅ 模拟 CPE 验证回写；✅ 实机 H168-383 验证（unread 6→5、本地/CPE 双向一致、删除后同步无拉回） |
+| P3.4 | SMS 列表 UI | `sms.htm`：全部/未读/搜索/号码筛选/排序/未读计数 | ⏸ pen.dev 审阅后实施（见 P3.6） |
+| P3.5 | 发送（可选） | `SendSms` 接入 | ⏸ pen.dev 审阅后实施（见 P3.6） |
+| P3.6 | UI 设计（pen.dev） | 使用 pen.dev 设计 UI（草案，先出方案不落代码） | ⏸ 待用户审阅后再应用（暂不实施，不进入 M4 验收）；P3.4/P3.5 依赖此审阅 |
 
 **M4 完成标志**：短信自动入库；重复同步无重复通知；未读计数正确。
-> ⏸ **P3.6 说明**：已列入计划，但**暂不实施**——待用户审阅 pen.dev UI 设计方案并批准后再应用。此期间不影响 P3.3–P3.5 正常开发。
+> ⏸ **P3.6 说明**：已列入计划，但**暂不实施**——待用户审阅 pen.dev UI 设计方案并批准后再应用。用户指示 UI 最后设计（pen.dev），因此 **P3.4（列表 UI）与 P3.5（发送 UI）顺延至审阅通过后**；后端 API（read/delete 已实机验证）不阻塞。
+> 📄 **短信双向回复协议**：`docs/05-sms-reply-protocol.md`（设计草案，待审阅）——Phase 4 实现 Telegram/Email/Webhook 回复+命令时配套。
 
 ### Phase 4 — 通知
 
