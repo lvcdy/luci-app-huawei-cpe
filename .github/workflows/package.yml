@@ -1,4 +1,4 @@
-# 打包：用官方 OpenWrt SDK 交叉编译本项目，产出可安装的 ipk/apk 包
+# 打包：用官方 OpenWrt SDK 交叉编译本项目，产出 apk 安装包（OpenWrt 24.10 使用 apk 包管理器）
 #   - 默认目标: 24.10.0 / ramips-mt7621 (mipsel_24kc)，可在 workflow_dispatch 时选择
 #   - 将包输出目录（bin/）上传为 CI artifacts；打 tag 时自动发布到 GitHub Release
 name: package
@@ -148,15 +148,15 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          # 收集所有安装包（ipk 旧格式 / apk 新格式），连带源码包清单一并放平
-          find sdk/bin -type f \( -name '*.apk' -o -name '*.ipk' \) -print0 2>/dev/null \
+          # 只收集 apk 安装包（OpenWrt 24.10 新包格式），连带校验清单一并放平
+          find sdk/bin -type f -name '*.apk' -print0 2>/dev/null \
             | xargs -0 -r -I{} cp -v {} dist/
           if [ -n "$(find dist -type f 2>/dev/null)" ]; then
             (cd dist && sha256sum * > SHA256SUMS)
             echo "产物清单："
             ls -la dist
           else
-            echo "::error::未找到 apk/ipk 产物，请查看上方编译日志"
+            echo "::error::未找到 apk 产物，请查看上方编译日志"
             exit 1
           fi
 
