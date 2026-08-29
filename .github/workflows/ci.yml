@@ -1,0 +1,53 @@
+# CI：每次 push / PR 快速校验
+#   - Go daemon：build + vet + test（Linux runner）
+#   - LuCI 前端：view/*.htm 内联 JS 语法检查 + *.lua 语法检查
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  go:
+    name: go-build-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+          cache-dependency-path: src/go.sum
+
+      - name: Build
+        working-directory: src
+        run: go build ./...
+
+      - name: Vet
+        working-directory: src
+        run: go vet ./...
+
+      - name: Test
+        working-directory: src
+        run: go test -count=1 ./...
+
+  luci:
+    name: luci-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: LuCI view inline JS syntax check
+        run: node scripts/check-luci-js.mjs luci/view/huawei_cpe/*.htm
+
+      - name: Lua syntax check
+        run: |
+          sudo apt-get update && sudo apt-get install -y lua5.4
+          find luci -name '*.lua' -print0 | xargs -0 -n1 luac5.4 -p

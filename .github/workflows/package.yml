@@ -1,0 +1,179 @@
+# 打包：用官方 OpenWrt SDK 交叉编译本项目，产出可安装的 ipk/apk 包
+#   - 默认目标: 24.10.0 / ramips-mt7621 (mipsel_24kc)，可在 workflow_dispatch 时选择
+#   - 将包输出目录（bin/）上传为 CI artifacts；打 tag 时自动发布到 GitHub Release
+name: package
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '要打包的分支或 tag（留空 = 默认分支）'
+        required: false
+        default: ''
+      target:
+        description: 'OpenWrt SDK 目标架构'
+        required: false
+        default: 'ramips/mt7621'
+
+# 允许 tag push 时创建/更新 Release（GITHUB_TOKEN 的 Contents: write 权限）
+permissions:
+  contents: write
+
+concurrency:
+  group: package-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  OPENWRT_RELEASE: '24.10.0'
+  # SDK 下载后源包默认在 scripts/ 里解出的软件包会被覆盖，这里统一路径
+  SDK_ROOT: ${{ github.workspace }}/sdk
+  PKG_DIR: ${{ github.workspace }}/sdk/package/luci-app-huawei-cpe
+  # Go 依赖走代理缓存，避免每次都重新拉取
+  GOPROXY: https://proxy.golang.org,direct
+
+jobs:
+  build:
+    name: sdk-${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - ramips/mt7621
+          # - ipq40xx/generic   # 解禁即多架构打包
+          # - mediatek/filogic  # 解禁即多架构打包
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      # ---------- OpenWrt 构建系统依赖 ----------
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang flex bison gawk gettext \
+            texinfo unzip file rsync wget \
+            libssl-dev zlib1g-dev python3 zstd
+
+      # ---------- 下载并校验 OpenWrt SDK ----------
+      - name: Download & verify OpenWrt SDK
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.cache/openwrt-sdk"
+          arch="${{ matrix.target }}"
+          # target → 目录名（如 ramips/mt7621 → ramips-mt7621）
+          dir="${arch//\//-}"
+          url="https://downloads.openwrt.org/releases/${OPENWRT_RELEASE}/targets/${arch}/openwrt-sdk-${OPENWRT_RELEASE}-${dir}_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
+          sha=$(curl -fsSL "https://downloads.openwrt.org/releases/${OPENWRT_RELEASE}/targets/${arch}/sha256sums" \
+            | awk -v p="openwrt-sdk-${OPENWRT_RELEASE}-${dir}_gcc-13.3.0_musl.Linux-x86_64.tar.zst" '$2 == "*" p { print $1; exit }')
+          [ -n "$sha" ] || { echo "未找到 SDK 校验和"; exit 1; }
+          echo "SDK_URL=$url"
+          echo "SDK_SHA256=$sha"
+          echo "SDK_URL=$url" >> "$GITHUB_ENV"
+          echo "SDK_SHA256=$sha" >> "$GITHUB_ENV"
+
+      - name: Cache SDK tarball
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.sdk-cache
+          key: openwrt-sdk-${{ matrix.target }}-${{ env.OPENWRT_RELEASE }}
+
+      - name: Extract SDK
+        run: |
+          set -euo pipefail
+          arch="${{ matrix.target }}"
+          dir="${arch//\//-}"
+          tarball="openwrt-sdk-${OPENWRT_RELEASE}-${dir}_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
+          if [ ! -f ".sdk-cache/${tarball}" ]; then
+            curl -fL "$SDK_URL" -o ".sdk-cache/${tarball}"
+          fi
+          echo "${SDK_SHA256}  .sdk-cache/${tarball}" | sha256sum -c -
+          mkdir -p sdk
+          tar --zstd -xf ".sdk-cache/${tarball}" -C sdk --strip-components=1
+          ls sdk
+
+      # ---------- feeds：只需要 packages（golang/jq）与 luci（luci-base） ----------
+      - name: Update feeds
+        working-directory: sdk
+        run: |
+          ./scripts/feeds update packages luci
+
+      - name: Install feed packages
+        working-directory: sdk
+        run: |
+          ./scripts/feeds install golang jq luci-base
+
+      # ---------- Makefile 引用 $(TOPDIR)/../toolchain/golang/golang-package.mk ----------
+      - name: Link golang toolchain (for Makefile include path)
+        run: |
+          set -euo pipefail
+          # 仓库 Makefile 通过 $(TOPDIR)/../toolchain/golang/golang-package.mk 引用 golang 工具链，
+          # 即在 SDK 外一层查找；这里用符号链接指向 feeds 中的 golang 包目录
+          mkdir -p "${{ github.workspace }}/toolchain"
+          ln -sfn "$SDK_ROOT/feeds/packages/lang/golang" "${{ github.workspace }}/toolchain/golang"
+          ls -la "${{ github.workspace }}/toolchain"
+
+      # ---------- 把本项目作为本地 package 放进去 ----------
+      - name: Install package sources
+        run: |
+          set -euo pipefail
+          mkdir -p "$PKG_DIR"
+          # 只复制构建所需内容（避免把 .git / .github 本身打进去）
+          cp -r Makefile luci root src LICENSE README.md "$PKG_DIR"/
+
+      # ---------- 编译两个包 ----------
+      - name: Compile packages
+        working-directory: sdk
+        run: |
+          make defconfig
+          # 预热 golang host 工具链（路径为 feeds 安装后的标准位置）
+          make package/feeds/packages/golang/host/compile V=s \
+            || echo "::warning::golang host 构建失败，继续尝试主编译"
+          # huawei-cpe + luci-app-huawei-cpe 两个包一次编译，依赖关系自动解析
+          make package/luci-app-huawei-cpe/compile V=s
+
+      # ---------- 收集产物 ----------
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # 收集所有安装包（ipk 旧格式 / apk 新格式），连带源码包清单一并放平
+          find sdk/bin -type f \( -name '*.apk' -o -name '*.ipk' \) -print0 2>/dev/null \
+            | xargs -0 -r -I{} cp -v {} dist/
+          if [ -n "$(find dist -type f 2>/dev/null)" ]; then
+            (cd dist && sha256sum * > SHA256SUMS)
+            echo "产物清单："
+            ls -la dist
+          else
+            echo "::error::未找到 apk/ipk 产物，请查看上方编译日志"
+            exit 1
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.target }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 14
+
+      # ---------- 打 tag 时发布到 GitHub Release ----------
+      - name: Publish release (tag push only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
