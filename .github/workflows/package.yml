@@ -155,6 +155,13 @@ jobs:
         working-directory: sdk
         run: |
           make defconfig
+          # snapshot 已移除 lua5.1/liblua 旧包名，liblucihttp-lua 变体依赖它们无法编译（缺 lua.h）。
+          # 本项目经 luci-base 只依赖 liblucihttp-ucode，不需要 lua 变体；显式禁用避免构建失败。
+          # 注意：sed 后再跑 defconfig 会把设置覆盖回 =m，所以这里 sed 后直接编译。
+          sed -i '/CONFIG_PACKAGE_liblucihttp-lua/d;/CONFIG_PACKAGE_luci-lib-base/d;/CONFIG_PACKAGE_liblua\b/d;/CONFIG_PACKAGE_lua=/d' .config
+          echo '# CONFIG_PACKAGE_liblucihttp-lua is not set' >> .config
+          echo '# CONFIG_PACKAGE_luci-lib-base is not set' >> .config
+          grep -E 'liblucihttp|luci-lib-base' .config || true
           # 预热 golang host 工具链（路径为 feeds 安装后的标准位置）
           make package/feeds/packages/golang/host/compile V=s \
             || echo "::warning::golang host 构建失败，继续尝试主编译"
