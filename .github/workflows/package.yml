@@ -93,8 +93,10 @@ jobs:
           arch="${{ matrix.target }}"
           dir="${arch//\//-}"
           tarball="openwrt-sdk-${OPENWRT_RELEASE}-${dir}_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
+          # cache 未命中时目录不存在，先建目录
+          mkdir -p .sdk-cache
           if [ ! -f ".sdk-cache/${tarball}" ]; then
-            curl -fL "$SDK_URL" -o ".sdk-cache/${tarball}"
+            curl -fL --retry 3 --retry-all-errors "$SDK_URL" -o ".sdk-cache/${tarball}"
           fi
           echo "${SDK_SHA256}  .sdk-cache/${tarball}" | sha256sum -c -
           mkdir -p sdk
