@@ -22,3 +22,4 @@ tmp/
 Thumbs.db
 .idea/
 .vscode/
+src/.tmp-tests/

@@ -35,8 +35,10 @@ type MockCPE struct {
 	// loginFailOnce 使下一次 user/login 返回 108002（密码错误）。
 	loginFailOnce atomic.Bool
 
-	mu    sync.Mutex
-	snaps map[string]EndpointSnap
+	mu       sync.Mutex
+	snaps    map[string]EndpointSnap
+	rawSnaps map[string]string // 原始 XML 端点（优先级高于 snaps，用于嵌套结构如 sms-list）
+	handlers map[string]func(*http.Request) string // 动态端点（最高优先级；返回 XML body）
 }
 
 // NewMockCPE 构造 mock。username 是期望的登录用户名；登录态初始为未登录。
@@ -45,6 +47,8 @@ func NewMockCPE(username string) *MockCPE {
 		Username: username,
 		Token:    "test-csrf-token-abcdef123456",
 		snaps:    map[string]EndpointSnap{},
+		rawSnaps: map[string]string{},
+		handlers: map[string]func(*http.Request) string{},
 	}
 }
 
@@ -53,6 +57,24 @@ func (m *MockCPE) SetEndpoint(ep string, root string, body map[string]string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.snaps[ep] = EndpointSnap{Root: root, Body: body}
+}
+
+// SetEndpointRaw 配置某端点返回的原始 XML 文本（Content-Type: text/xml）。
+// 用于表达扁平键值无法覆盖的嵌套结构（如 sms-list 的 <Messages><Message>…）。
+// 优先级高于 SetEndpoint；调用方需自行转义内容。
+func (m *MockCPE) SetEndpointRaw(ep string, xml string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rawSnaps[ep] = xml
+}
+
+// SetEndpointHandler 配置某端点的动态 handler（最高优先级）。
+// handler 根据请求（含 body）返回 XML 文本；返回值原样写回。
+// 用于模拟分页/请求参数相关响应（如 sms-list 的 PageIndex 翻页）。
+func (m *MockCPE) SetEndpointHandler(ep string, h func(*http.Request) string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.handlers[ep] = h
 }
 
 // LoginFailNext 使下一次 user/login 返回密码错误（108002）。
@@ -122,8 +144,23 @@ func (m *MockCPE) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><response>OK</response>`))
 	default:
 		m.mu.Lock()
+		h, hasH := m.handlers[ep]
+		raw, rawOK := m.rawSnaps[ep]
 		snap, ok := m.snaps[ep]
 		m.mu.Unlock()
+		if hasH {
+			body := h(r)
+			w.Header().Set("Content-Type", "text/xml")
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(body))
+			return
+		}
+		if rawOK {
+			w.Header().Set("Content-Type", "text/xml")
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(raw))
+			return
+		}
 		if ok {
 			m.xmlResp(w, snap.Root, snap.Body)
 			return

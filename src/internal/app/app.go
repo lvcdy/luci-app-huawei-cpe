@@ -25,6 +25,7 @@ import (
 	"huawei-cpe/internal/history"
 	"huawei-cpe/internal/httpapi"
 	"huawei-cpe/internal/poller"
+	"huawei-cpe/internal/sms"
 )
 
 // State 持有 daemon 运行期组件。
@@ -36,6 +37,7 @@ type State struct {
 	mgr     *device.Manager
 	sqldb   *sql.DB // 历史存储（nil = 历史禁用）
 	pollers []*poller.Poller
+	syncers []*sms.Syncer
 	cancel  context.CancelFunc // 轮询循环的取消函数
 
 	quitOnce sync.Once
@@ -64,6 +66,7 @@ func (s *State) Run(reloadCh <-chan struct{}) error {
 	s.mgr = device.NewManager(s.log, s.cfg.CPEs)
 	s.openHistory(ctx)
 	s.startPollers(ctx)
+	s.startSMSSyncers(ctx)
 
 	// 装配 HTTP API（仅回环 127.0.0.1），读缓存不触发 CPE。
 	s.api = httpapi.New(s.log, s.cfg, s.store, s.mgr)
@@ -175,6 +178,37 @@ func (s *State) stopPollers() {
 	s.pollers = nil
 }
 
+// startSMSSyncers 为全部启用设备创建并启动短信同步 goroutine。
+// 数据库未打开（sqldb == nil = 历史/短信存储不可用）时跳过——同步器依赖 SQLite 去重入库。
+func (s *State) startSMSSyncers(ctx context.Context) {
+	if s.sqldb == nil {
+		s.log.Info("sms sync disabled (no history db)")
+		return
+	}
+	s.syncers = nil
+	for _, d := range s.mgr.Enabled() {
+		syn := sms.New(s.log, d, s.sqldb, d.SMSSyncInterval())
+		s.syncers = append(s.syncers, syn)
+		go syn.Start(ctx)
+	}
+	s.log.Info("sms syncers started", slog.Int("count", len(s.syncers)))
+}
+
+// stopSMSSyncers 停止全部短信同步循环并等待退出（有界等待，防止卡住关机）。
+func (s *State) stopSMSSyncers() {
+	for _, syn := range s.syncers {
+		syn.Stop()
+	}
+	for _, syn := range s.syncers {
+		select {
+		case <-syn.Done():
+		case <-time.After(6 * time.Second):
+			s.log.Warn("sms syncer stop timed out", slog.String("dev", syn.DeviceID()))
+		}
+	}
+	s.syncers = nil
+}
+
 // reload 重读 UCI 配置并应用（紧凑输出脱敏摘要）。
 // 设备集变化时重建轮询循环（简单可靠优先，架构 §6）。
 func (s *State) reload(ctx context.Context) {
@@ -192,6 +226,8 @@ func (s *State) reload(ctx context.Context) {
 		s.log.Info("device set changed", slog.Any("changes", changes))
 		s.stopPollers()
 		s.startPollers(ctx)
+		s.stopSMSSyncers()
+		s.startSMSSyncers(ctx)
 	}
 
 	s.log.Info("config reloaded",
@@ -205,6 +241,7 @@ func (s *State) shutdown() {
 		s.cancel()
 	}
 	s.stopPollers()
+	s.stopSMSSyncers() // 必须在 sqldb.Close 之前：同步器依赖数据库句柄
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if s.api != nil {

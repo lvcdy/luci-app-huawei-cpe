@@ -27,6 +27,44 @@ func TestOpenCreatesSchema(t *testing.T) {
 	if _, err := d.Exec(`INSERT INTO traffic_history (device_id, ts) VALUES ('x', 1)`); err != nil {
 		t.Fatalf("insert traffic: %v", err)
 	}
+	if _, err := d.Exec(`INSERT INTO sms (device_id, cpe_index, phone, content, status, received_at) VALUES ('x', 1, '+1', 'hi', 0, 1)`); err != nil {
+		t.Fatalf("insert sms: %v", err)
+	}
+}
+
+// TestSmsUnique 验证 (device_id, cpe_index) 唯一约束：
+// 重复同步同一条短信（相同 cpe_index）必须被拒绝，这是"重复同步不重复入库"的底层保证。
+func TestSmsUnique(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "h.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	const ins = `INSERT INTO sms (device_id, cpe_index, phone, content, status, received_at) VALUES (?, ?, ?, ?, ?, ?)`
+	if _, err := d.Exec(ins, "cpe1", 40, "+86138", "hello", 0, 1700000000); err != nil {
+		t.Fatalf("first insert: %v", err)
+	}
+	// 相同设备相同 cpe_index → 违反唯一约束
+	if _, err := d.Exec(ins, "cpe1", 40, "+86138", "hello again", 1, 1700000001); err == nil {
+		t.Fatal("duplicate (device_id, cpe_index) insert must fail")
+	}
+	// 不同设备相同 cpe_index → 允许（不同 CPE 的索引空间相互独立）
+	if _, err := d.Exec(ins, "cpe2", 40, "+86138", "hello", 0, 1700000000); err != nil {
+		t.Fatalf("same cpe_index on other device must succeed: %v", err)
+	}
+	// 相同设备不同 cpe_index → 允许
+	if _, err := d.Exec(ins, "cpe1", 41, "+86138", "second", 0, 1700000002); err != nil {
+		t.Fatalf("distinct cpe_index must succeed: %v", err)
+	}
+
+	var n int
+	if err := d.QueryRow("SELECT COUNT(*) FROM sms").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Errorf("want 3 rows, got %d", n)
+	}
 }
 
 // TestOpenIdempotent 验证重复打开（迁移幂等）不报错。

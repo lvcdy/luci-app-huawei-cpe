@@ -41,6 +41,11 @@ type Device struct {
 	online   bool      // 最近一次 CPE 可达且认证成功
 	lastSeen time.Time // 最近成功交互时间
 	closed   bool
+
+	// leaseMu 串行化租约期内对 SDK client 的访问。
+	// SDK session 无内置并发保护；poller（状态采集）与 SMS 同步器等
+	// 多循环共享同一连接时依赖此锁互斥（架构 §6：单设备串行请求）。
+	leaseMu sync.Mutex
 }
 
 // Logger 是 device 包依赖的最小日志接口，由 app 包注入实现。
@@ -106,6 +111,15 @@ func (d *Device) PollingInterval() time.Duration {
 	return time.Duration(d.cfg.PollingInterval) * time.Second
 }
 
+// SMSSyncInterval 返回配置的短信同步间隔时长；未配置返回 0（上层回落默认值，
+// 见 internal/sms 的 deFaultSyncInterval）。
+func (d *Device) SMSSyncInterval() time.Duration {
+	if d.cfg.SMSSyncInterval <= 0 {
+		return 0
+	}
+	return time.Duration(d.cfg.SMSSyncInterval) * time.Second
+}
+
 // Snapshot 返回设备状态的内存快照（不含凭据，供 API/页面展示）。
 func (d *Device) Snapshot() Snapshot {
 	d.mu.RLock()
@@ -134,13 +148,21 @@ type Snapshot struct {
 
 // Lease 建立（或复用）SDK 连接，返回可用客户端与释放函数。
 // 释放后连接保持打开，供后续租约复用；设备 Close 时统一关闭。
+//
+// 并发语义：租约期（Lease 返回 → release 调用）内独占该设备连接——
+// 多采集循环（poller / SMS 同步器）不得并发调用同一 SDK client
+// （SDK session 无内置锁）。release 既释放租约也解锁连接。
 // 返回的错误可能携带 Kind 分类（凭据错误 = KindPermanent）。
 func (d *Device) Lease(ctx context.Context) (*huaweilteapi.Client, func(), error) {
+	d.leaseMu.Lock()
 	client, err := d.connect(ctx)
+
+	// 加锁失败（closed）或连接失败：不独占锁，立即解锁返回。
 	if err != nil {
+		d.leaseMu.Unlock()
 		return nil, nil, classifyConnectErr(err)
 	}
-	return client, func() {}, nil
+	return client, d.leaseMu.Unlock, nil
 }
 
 // connect 建立 SDK 连接并登录（幂等：已有连接直接返回）。
@@ -181,9 +203,17 @@ func (d *Device) connect(ctx context.Context) (*huaweilteapi.Client, error) {
 
 // Relogin 强制重建会话：重置旧连接后重新创建（登录失效后由上层触发重试）。
 // 与 Close 不同，Relogin 不改变设备的已关闭状态，设备仍可继续使用。
+// 与 Lease 一样，返回的释放函数在租约结束后解锁连接（防止 resetConn
+// 打断其他循环正在进行的请求）。
 func (d *Device) Relogin(ctx context.Context) (*huaweilteapi.Client, func(), error) {
+	d.leaseMu.Lock()
 	d.resetConn()
-	return d.Lease(ctx)
+	client, err := d.connect(ctx)
+	if err != nil {
+		d.leaseMu.Unlock()
+		return nil, nil, classifyConnectErr(err)
+	}
+	return client, d.leaseMu.Unlock, nil
 }
 
 // resetConn 关闭并清空当前连接（不改变 closed 状态）。

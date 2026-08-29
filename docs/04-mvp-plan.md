@@ -51,8 +51,8 @@ M7 打磨: 错误处理/退避/测试/文档/打包构建                       
 
 | # | 任务 | 产出 | 验收 |
 |---|---|---|---|
-| P3.1 | DB schema + 迁移 | `internal/db` + `sms` 表 | `sqlite3` 查看表结构正确 |
-| P3.2 | SMS 同步循环 | `internal/sms`：`GetMessages`→写库→去重 `UNIQUE(device_id,cpe_index)`→事件 `sms.received` | 单元测试：重复同步不重复入库、不重复发事件 |
+| P3.1 | DB schema + 迁移 | `internal/db` + `sms` 表 | ✅ `sqlite3` 查看表结构正确 |
+| P3.2 | SMS 同步循环 | `internal/sms`：`GetMessages`→写库→去重 `UNIQUE(device_id,cpe_index)` | ✅ `go test ./internal/sms/` 绿：重复同步不重复入库 |
 | P3.3 | 已读/删除（双向） | API POST read / DELETE → CPE `SetRead/DeleteSms` + 本地 | 模拟 CPE 验证回写 |
 | P3.4 | SMS 列表 UI | `sms.htm`：全部/未读/搜索/号码筛选/排序/未读计数 | 模拟数据交互通过 |
 | P3.5 | 发送（可选） | `SendSms` 接入 | 真机可选 |

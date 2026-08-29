@@ -69,10 +69,11 @@ func TestDeviceConnectAndLease(t *testing.T) {
 
 	// 再次租约应复用连接（不重新登录）
 	before := m.logins()
-	_, _, err = d.Lease(ctx)
+	_, release2, err := d.Lease(ctx)
 	if err != nil {
 		t.Fatalf("second Lease failed: %v", err)
 	}
+	release2()
 	if got := m.logins() - before; got != 0 {
 		t.Fatalf("expected connection reuse (0 new logins), got %d", got)
 	}
@@ -134,19 +135,21 @@ func TestDeviceReloginDoesFullHandshake(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	_, _, err := d.Lease(ctx)
+	_, release1, err := d.Lease(ctx)
 	if err != nil {
 		t.Fatalf("initial lease failed: %v", err)
 	}
+	release1()
 	before := m.logins()
 
 	// 会话在设备端过期
 	m.setStateLoggedIn(false)
 
-	_, _, err = d.Relogin(ctx)
+	_, release2, err := d.Relogin(ctx)
 	if err != nil {
 		t.Fatalf("relogin failed: %v", err)
 	}
+	release2()
 	if got := m.logins() - before; got == 0 {
 		t.Fatal("expected a new login after Relogin")
 	}
