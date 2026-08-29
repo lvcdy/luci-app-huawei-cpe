@@ -21,6 +21,12 @@
 	.hcpe-sigbar { height:6px; border-radius:3px; background:#eee; overflow:hidden; margin-top:2px; }
 	.hcpe-sigbar > div { height:100%; background:#4caf50; }
 	.hcpe-muted { color:#999; font-size:12px; }
+	.hcpe-actions { display:flex; gap:8px; flex-wrap:wrap; }
+	.hcpe-actions button { cursor:pointer; }
+	.hcpe-lock-form { margin-top:8px; display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+	.hcpe-lock-form input { padding:3px 6px; }
+	.hcpe-badge.paused { background:#e8eaf6; color:#3f51b5; }
+	.hcpe-log-scroll { max-height:200px; overflow-y:auto; }
 </style>
 
 <h2 name="content"><%:Huawei CPE%></h2>
@@ -87,6 +93,27 @@
 		xhr.send();
 	}
 
+	function sendJSON(url, method, data, cb) {
+		var xhr = new XMLHttpRequest();
+		xhr.open(method, url, true);
+		xhr.setRequestHeader('Content-Type', 'application/json');
+		xhr.onreadystatechange = function () {
+			if (xhr.readyState !== 4) return;
+			cb(xhr.status, xhr.responseText);
+		};
+		xhr.send(data ? JSON.stringify(data) : null);
+	}
+
+	// bps → 可读速率（bps/kbps/mbps/gbps），与 fmtBytes 类似但按 1000 进率。
+	function fmtRateBytes(b) {
+		if (b === null || b === undefined || isNaN(b)) return '—';
+		b = Number(b);
+		if (b === 0) return '0 bps';
+		var u = ['bps', 'kbps', 'Mbps', 'Gbps'], i = 0;
+		while (b >= 1000 && i < u.length - 1) { b /= 1000; i++; }
+		return (i === 0 ? b : b.toFixed(2)) + ' ' + u[i];
+	}
+
 	// RSRP → 0~100 质量百分比（线性映射：-120dBm=0，-70dBm=100）
 	function rsrpQuality(rsrp) {
 		if (rsrp === null || rsrp === undefined) return 0;
@@ -102,13 +129,20 @@
 		var online = !!d.online;
 		var caps = d.caps || {};
 		var sig = d.signal || {}, net = d.network || {}, tr = d.traffic || {}, info = d.info || {};
+		var cell = d.cell || {}, qos = d.qos || {}, dta = d.data || {}, lock = d.lock || {};
+		var carrier = d.carrier || [], neighbors = d.neighbors || [], logs = d.log || [];
+		var key = String(d.device).replace(/[^\w.-]/g, '_');
 
 		var badge = online
 			? (d.fresh ? '<span class="hcpe-badge on"><%:Online%></span>'
 				: '<span class="hcpe-badge stale"><%:Stale%></span>')
 			: '<span class="hcpe-badge off"><%:Offline%></span>';
+		// 功能 10：暂停中徽章
+		if (d.suspended) {
+			badge += ' <span class="hcpe-badge paused"><%:Paused%></span>';
+		}
 
-		var html = '<div class="hcpe-card"><h3>' + esc(d.device) + ' ' + badge + '</h3>' +
+		var html = '<div class="hcpe-card" id="hcpe-dev-' + key + '"><h3>' + esc(d.device) + ' ' + badge + '</h3>' +
 			'<table class="hcpe-kv">' +
 			kv('<%:Host%>', esc(hosts[d.device])) +
 			kv('<%:Last poll%>', fmtTime(d.polled_at)) +
@@ -126,7 +160,59 @@
 				kv('RSSI', sig.rssi !== null && sig.rssi !== undefined ? esc(sig.rssi) + ' dBm' : null) +
 				kv('<%:Mode%>', esc(sig.mode)) +
 				kv('<%:Band%>', esc(sig.band)) +
+				// 功能 1：小区详情增强字段
+				(sig.arfcn ? kv('ARFCN', esc(sig.arfcn)) : '') +
+				(sig.earfcn ? kv('EARFCN', esc(sig.earfcn)) : '') +
+				(sig.nrarfcn ? kv('NRARFCN', esc(sig.nrarfcn)) : '') +
+				(sig.bandwidth ? kv('<%:Bandwidth%>', esc(sig.bandwidth) + ' MHz') : '') +
+				(sig.cqi ? kv('CQI', esc(sig.cqi)) : '') +
+				(sig.cell_id ? kv('<%:Cell ID%>', esc(sig.cell_id)) : '') +
 				'</table><div class="hcpe-sigbar"><div style="width:' + q + '%"></div></div></div>';
+		}
+
+		// 小区详情卡（功能 1，net/cell-info 独立键，与信号卡字段互补）
+		if (caps.cellinfo !== false && (cell.arfcn || cell.earfcn || cell.nrarfcn || cell.bandwidth || cell.cqi || cell.cell_id)) {
+			html += '<div class="hcpe-card"><h3><%:Cell Detail%></h3><table class="hcpe-kv">' +
+				(cell.arfcn ? kv('ARFCN', esc(cell.arfcn)) : '') +
+				(cell.earfcn ? kv('EARFCN', esc(cell.earfcn)) : '') +
+				(cell.nrarfcn ? kv('NRARFCN', esc(cell.nrarfcn)) : '') +
+				(cell.bandwidth ? kv('<%:Bandwidth%>', esc(cell.bandwidth) + ' MHz') : '') +
+				(cell.cqi ? kv('CQI', esc(cell.cqi)) : '') +
+				(cell.pci ? kv('PCI', esc(cell.pci)) : '') +
+				(cell.cell_id ? kv('<%:Cell ID%>', esc(cell.cell_id)) : '') +
+				'</table></div>';
+		}
+
+		// 载波聚合卡（功能 3）：辅小区列表
+		if (caps.carrier_agg !== false && carrier.length) {
+			html += '<div class="hcpe-card"><h3><%:Carrier Aggregation%></h3>';
+			carrier.forEach(function (c) {
+				html += '<table class="hcpe-kv">' +
+					(c.band ? kv('<%:Band%>', esc(c.band)) : '') +
+					(c.arfcn ? kv('ARFCN', esc(c.arfcn)) : '') +
+					(c.bw ? kv('<%:BW%>', esc(c.bw) + ' MHz') : '') +
+					(c.pci ? kv('PCI', esc(c.pci)) : '') +
+					(c.rsrp !== undefined && c.rsrp !== null ? kv('RSRP', esc(c.rsrp) + ' dBm') : '') +
+					(c.rsrq !== undefined && c.rsrq !== null ? kv('RSRQ', esc(c.rsrq) + ' dB') : '') +
+					'</table>';
+			});
+			html += '</div>';
+		}
+
+		// 邻区卡（功能 3）：最多展示前 6 条
+		if (caps.neighbor !== false && neighbors.length) {
+			html += '<div class="hcpe-card"><h3><%:Neighbor Cells%></h3>';
+			var nLen = Math.min(neighbors.length, 6);
+			for (var ni = 0; ni < nLen; ni++) {
+				var nb = neighbors[ni];
+				html += '<table class="hcpe-kv">' +
+					(nb.band ? kv('<%:Band%>', esc(nb.band)) : '') +
+					(nb.arfcn ? kv('ARFCN', esc(nb.arfcn)) : '') +
+					(nb.pci ? kv('PCI', esc(nb.pci)) : '') +
+					(nb.rsrp !== undefined && nb.rsrp !== null ? kv('RSRP', esc(nb.rsrp) + ' dBm') : '') +
+					'</table>';
+			}
+			html += '</div>';
 		}
 
 		// 网络卡
@@ -136,6 +222,18 @@
 				kv('<%:Provider%>', esc(net.provider_name || net.short_name)) +
 				kv('<%:Registered%>', net.registered ? '<%:Yes%>' : '<%:No%>') +
 				kv('<%:Roaming%>', net.roaming ? '<%:Yes%>' : '<%:No%>') +
+				'</table></div>';
+		}
+
+		// QoS 卡（功能 2）：AMBR / QCI / 速度限制
+		if (qos && (qos.qci || qos.speed_limit || qos.dl_ambr || qos.ul_ambr || qos.max_dl_speed || qos.max_ul_speed)) {
+			html += '<div class="hcpe-card"><h3><%:QoS%></h3><table class="hcpe-kv">' +
+				(qos.qci ? kv('QCI', esc(qos.qci)) : '') +
+				(qos.dl_ambr ? kv('<%:DL AMBR%>', fmtRateBytes(qos.dl_ambr)) : '') +
+				(qos.ul_ambr ? kv('<%:UL AMBR%>', fmtRateBytes(qos.ul_ambr)) : '') +
+				(qos.max_dl_speed ? kv('<%:Max DL%>', fmtRateBytes(qos.max_dl_speed)) : '') +
+				(qos.max_ul_speed ? kv('<%:Max UL%>', fmtRateBytes(qos.max_ul_speed)) : '') +
+				(qos.speed_limit ? kv('<%:Speed limit%>', '<span class="hcpe-badge off"><%:Active%></span>') : '') +
 				'</table></div>';
 		}
 
@@ -149,6 +247,62 @@
 				kv('<%:Total download%>', fmtBytes(tr.total_rx_bytes)) +
 				kv('<%:Total upload%>', fmtBytes(tr.total_tx_bytes)) +
 				'</table></div>';
+		}
+
+		// 系统操作日志卡（功能 4）：最多显示最近 12 条
+		if (caps.log !== false && logs.length) {
+			html += '<div class="hcpe-card"><h3><%:System Log%></h3><table class="hcpe-kv">';
+			var lLen = Math.min(logs.length, 12);
+			for (var li = 0; li < lLen; li++) {
+				html += '<tr><td>' + fmtTime(logs[li].time) + '</td><td>' +
+					esc(logs[li].info || '') + '</td></tr>';
+			}
+			html += '</table></div>';
+		}
+
+		// 锁频管理卡（功能 5）：当前锁状态 + 锁频/解锁表单
+		if (caps.lock !== false) {
+			html += '<div class="hcpe-card"><h3><%:Cell Lock%></h3><table class="hcpe-kv">' +
+				kv('<%:Status%>', lock.lock === 1 ? '<span class="hcpe-badge on"><%:Locked%></span>'
+					: '<span class="hcpe-badge off"><%:Auto%></span>') +
+				(lock.lock === 1 && lock.freq ? kv('<%:Frequency%>', esc(lock.freq)) : '') +
+				(lock.lock === 1 && lock.pci ? kv('PCI', esc(lock.pci)) : '') +
+				(lock.maxfreq ? kv('<%:Max freq%>', esc(lock.maxfreq)) : '') +
+				'</table>' +
+				'<div class="hcpe-lock-form">' +
+					'<span class="hcpe-muted"><%:Lock to:%></span> ' +
+					'<input type="number" id="hcpe-freq-' + key + '" placeholder="<%:freq%>" style="width:80px"> ' +
+					'<input type="number" id="hcpe-pci-' + key + '" placeholder="<%:pci%>" style="width:70px"> ' +
+					'<button type="button" class="cbi-button cbi-button-apply" data-lock="' + key + '"><%:Lock%></button> ' +
+					'<button type="button" class="cbi-button cbi-button-reset" data-unlock="' + key + '"><%:Unlock%></button>' +
+				'</div>' +
+				// 网络模式切换（功能 5 的 setNetMode 部分）
+				'<div class="hcpe-lock-form" style="margin-top:6px">' +
+					'<label for="hcpe-nm-' + key + '" class="hcpe-muted"><%:Network mode:%></label> ' +
+					'<select id="hcpe-nm-' + key + '">' +
+						'<option value="00"><%:Auto%></option>' +
+						'<option value="03"><%:4G only%></option>' +
+						'<option value="0301"><%:4G/2G auto%></option>' +
+						'<option value="0302"><%:4G/3G auto%></option>' +
+					'</select> ' +
+					'<button type="button" class="cbi-button cbi-button-apply" data-netmode="' + key + '"><%:Apply%></button>' +
+				'</div></div>';
+		}
+
+		// 操作卡（功能 6/7）：数据开关 + 重启
+		var ops = '';
+		if (caps.data_switch !== false) {
+			var dsOn = dta.dataswitch === 1;
+			ops += '<button type="button" class="cbi-button cbi-button-' +
+				(dsOn ? 'reset' : 'apply') + '" data-dataswitch="' + key + '" data-cur="' +
+				(dsOn ? '1' : '0') + '">' +
+				(dsOn ? '<%:Data: Turn Off%></button> ' : '<%:Data: Turn On%></button> ');
+		}
+		if (caps.reboot !== false && caps.reboot !== undefined) {
+			ops += '<button type="button" class="cbi-button cbi-button-reset" data-reboot="' + key + '"><%:Reboot%></button> ';
+		}
+		if (ops) {
+			html += '<div class="hcpe-card"><h3><%:Actions%></h3><div class="hcpe-actions">' + ops + '</div></div>';
 		}
 
 		return html;
@@ -189,13 +343,81 @@
 			banner(null);
 			firstLoad = false;
 			hosts = {};
+			var devs = res.devices || [];
 			var enabled = devs.filter(function (d) { return d.enabled !== false; });
 			enabled.forEach(function (d) { hosts[d.id] = d.host; });
-			deviceIds = enabledeviceIds = devs.filter(function (d) { return d.enabled !== false; })
-				.map(function (d) { return d.id; });
+			deviceIds = enabled.map(function (d) { return d.id; });
 			renderDevices();
 		});
 	}
+
+	// 按钮事件委派（锁频/解锁/数据开关/重启）。内容每 5s 重绘，事件挂 root 上。
+	function post(device, path, payload, okMsg) {
+		sendJSON(API_BASE + '/devices/' + encodeURIComponent(device) + path, 'POST', payload, function (status, text) {
+			if (status === 200) {
+				if (okMsg) banner(okMsg);
+				else banner(null);
+			} else {
+				try { banner('<%:Error:%> ' + JSON.parse(text).error || text); }
+				catch (e) { banner('<%:Error:%> HTTP ' + status); }
+			}
+		});
+	}
+
+	function onRootClick(e) {
+		var t = e.target;
+		var lockKey = t.getAttribute && t.getAttribute('data-lock');
+		var unlockKey = t.getAttribute && t.getAttribute('data-unlock');
+		var dsKey = t.getAttribute && t.getAttribute('data-dataswitch');
+		var rebootKey = t.getAttribute && t.getAttribute('data-reboot');
+		var nmKey = t.getAttribute && t.getAttribute('data-netmode');
+		if (lockKey) {
+			var freq = $('hcpe-freq-' + lockKey);
+			var pci = $('hcpe-pci-' + lockKey);
+			post(lockKey, '/cell-lock', {
+				lock: 1,
+				freq: parseInt(freq.value, 10) || 0,
+				pci: parseInt(pci.value, 10) || 0
+			}, '<%:Cell locked.%>');
+		}
+		else if (unlockKey) {
+			post(unlockKey, '/cell-lock', { lock: 0, freq: 0, pci: 0 }, '<%:Cell unlocked.%>');
+		}
+		else if (dsKey) {
+			var cur = t.getAttribute('data-cur') === '1';
+			// 按钮显示的是“动作”而非状态：当前开 → 点击关，当前关 → 点击开
+			post(dsKey, '/data-switch', { on: !cur }, '<%:Data switch applied.%>');
+		}
+		else if (rebootKey) {
+			if (confirm('<%:Reboot the CPE? This will disconnect it for a minute.%>')) {
+				post(rebootKey, '/reboot', null, '<%:Reboot requested.%>');
+			}
+		}
+		else if (nmKey) {
+			var nm = $('hcpe-nm-' + nmKey);
+			post(nmKey, '/net-mode', { network_mode: nm.value }, '<%:Network mode applied.%>');
+		}
+	}
+
+	// 功能 10：页面失焦（后台标签页/切走）→ 暂停轮询；返回 → 恢复轮询。
+	var lastVisible = true;
+	function setPolling(suspend) {
+		if (!deviceIds.length) return;
+		deviceIds.forEach(function (id) {
+			var p = suspend ? '/polling/suspend' : '/polling/resume';
+			sendJSON(API_BASE + '/devices/' + encodeURIComponent(id) + p, 'POST', null, function () { });
+		});
+	}
+	document.addEventListener('visibilitychange', function () {
+		var vis = document.visibilityState === 'visible';
+		if (vis !== lastVisible) {
+			lastVisible = vis;
+			if (!vis) { setPolling(true); clearInterval(timer); }
+			else { setPolling(false); if (!timer) timer = setInterval(refresh, POLL_MS); }
+		}
+	});
+
+	$('hcpe-root').addEventListener('click', onRootClick);
 
 	refresh();
 	timer = setInterval(refresh, POLL_MS);

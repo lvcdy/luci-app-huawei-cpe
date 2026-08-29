@@ -27,16 +27,26 @@ import (
 // DefaultAddr 是 API 监听地址（仅回环）。Phase 2+ 起可配置。
 const DefaultAddr = "127.0.0.1:9090"
 
+// PauseController 是功能 10（后台暂停/恢复轮询）的最小接口。
+// 由 app 装配时注入：SetPollers(id → poller)。
+// 前端页面失焦时 Suspend（停止请求 CPE），聚焦时 Resume（立即恢复采集）。
+type PauseController interface {
+	Suspend()
+	Resume()
+	IsSuspended() bool
+}
+
 // Server 是 HTTP JSON API 服务。
 type Server struct {
-	log   *slog.Logger
-	cfg   *config.Config
-	store *cache.Store // 轮询快照缓存（读缓存，绝不触发 CPE 请求）
-	mgr   *device.Manager
-	db    *sql.DB // 历史存储（nil = 历史功能禁用，趋势端点返回空集）
-	srv   *http.Server
-	ln    net.Listener
-	mux   *http.ServeMux
+	log     *slog.Logger
+	cfg     *config.Config
+	store   *cache.Store // 轮询快照缓存（读缓存，绝不触发 CPE 请求）
+	mgr     *device.Manager
+	pollers map[string]PauseController // 功能 10：按设备 id 控制轮询暂停/恢复
+	db      *sql.DB                    // 历史存储（nil = 历史功能禁用，趋势端点返回空集）
+	srv     *http.Server
+	ln      net.Listener
+	mux     *http.ServeMux
 }
 
 // New 创建 API server（未监听，需调用 Start）。
@@ -56,6 +66,16 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/devices/{id}/sms", s.handleSmsList)
 	s.mux.HandleFunc("POST /api/v1/devices/{id}/sms/{sid}/read", s.handleSmsMarkRead)
 	s.mux.HandleFunc("DELETE /api/v1/devices/{id}/sms/{sid}", s.handleSmsDelete)
+	// 功能 5/6/7：设备写操作（锁频 / 网络模式 / 流量开关 / 重启）
+	s.mux.HandleFunc("GET /api/v1/devices/{id}/cell-lock", s.handleCellLockGet)
+	s.mux.HandleFunc("POST /api/v1/devices/{id}/cell-lock", s.handleCellLock)
+	s.mux.HandleFunc("POST /api/v1/devices/{id}/net-mode", s.handleNetMode)
+	s.mux.HandleFunc("POST /api/v1/devices/{id}/data-switch", s.handleDataSwitch)
+	s.mux.HandleFunc("POST /api/v1/devices/{id}/reboot", s.handleReboot)
+	// 功能 10：暂停/恢复轮询（后台降载）
+	s.mux.HandleFunc("POST /api/v1/devices/{id}/polling/suspend", s.handlePollingSuspend)
+	s.mux.HandleFunc("POST /api/v1/devices/{id}/polling/resume", s.handlePollingResume)
+	s.mux.HandleFunc("GET /api/v1/devices/{id}/polling", s.handlePollingStatus)
 	s.mux.HandleFunc("GET /api/v1/devices/{id}", s.handleDeviceByID)
 	s.mux.HandleFunc("GET /api/v1/status", s.handleStatus)
 }
@@ -97,6 +117,12 @@ func (s *Server) UpdateConfig(cfg *config.Config) { s.cfg = cfg }
 func (s *Server) SetManagers(store *cache.Store, mgr *device.Manager) {
 	s.store = store
 	s.mgr = mgr
+}
+
+// SetPollers 热更新轮询暂停控制器映射（功能 10：reload 时调用）。
+// 以”device id → poller”形式注入，供暂停/恢复端点使用。
+func (s *Server) SetPollers(pollers map[string]PauseController) {
+	s.pollers = pollers
 }
 
 // SetDB 设置历史存储（nil = 禁用历史）。
@@ -200,6 +226,8 @@ func (s *Server) handleDeviceByID(w http.ResponseWriter, r *http.Request) {
 		"fresh":     fresh,
 		"polled_at": snap.At,
 		"online":    snap.Online,
+		// 功能 10：后台暂停状态（未装配 poller 控制时为 false）
+		"suspended": s.pollerFor(id) != nil && s.pollerFor(id).IsSuspended(),
 		"info":      snap.Info,
 		"signal": map[string]any{
 			"rsrp": snap.Signal.RSRP,
@@ -210,7 +238,43 @@ func (s *Server) handleDeviceByID(w http.ResponseWriter, r *http.Request) {
 			"band": snap.Signal.Band,
 			"plmn": snap.Signal.PLMN,
 			"pci":  snap.Signal.PCI,
+			// 功能 1：小区详情增强
+			"arfcn":     snap.Signal.ARFCN,
+			"earfcn":    snap.Signal.EARFCN,
+			"nrarfcn":   snap.Signal.NRARFCN,
+			"bandwidth": snap.Signal.Bandwidth,
+			"cqi":       snap.Signal.CQI,
+			"cell_id":   snap.Signal.CellID,
 		},
+		"cell": map[string]any{
+			"arfcn":     snap.Cell.ARFCN,
+			"earfcn":    snap.Cell.EARFCN,
+			"nrarfcn":   snap.Cell.NRARFCN,
+			"bandwidth": snap.Cell.Bandwidth,
+			"cqi":       snap.Cell.CQI,
+			"pci":       snap.Cell.PCI,
+			"cell_id":   snap.Cell.CellID,
+		},
+		"carrier":   snap.Carrier,
+		"neighbors": snap.Neighbor,
+		"lock": map[string]any{
+			"lock":    snap.Lock.Lock,
+			"freq":    snap.Lock.Freq,
+			"pci":     snap.Lock.PCI,
+			"maxfreq": snap.Lock.MaxFreq,
+		},
+		"data": map[string]any{
+			"dataswitch": snap.Data.DataSwitch,
+		},
+		"qos": map[string]any{
+			"qci":          snap.QoS.QCI,
+			"dl_ambr":      snap.QoS.DlAmbr,
+			"ul_ambr":      snap.QoS.UlAmbr,
+			"max_dl_speed": snap.QoS.MaxDlSpeed,
+			"max_ul_speed": snap.QoS.MaxUlSpeed,
+			"speed_limit":  snap.QoS.SpeedLimit,
+		},
+		"log": snap.Log,
 		"network": map[string]any{
 			"type":          snap.Network.CurrentNetworkType,
 			"domain":        snap.Network.CurrentServiceDomain,
@@ -230,12 +294,17 @@ func (s *Server) handleDeviceByID(w http.ResponseWriter, r *http.Request) {
 			"tx_rate":          snap.Traffic.TxRate,
 		},
 		"caps": map[string]any{
-			"sms":      snap.Caps.SMS,
-			"signal":   snap.Caps.Signal,
-			"traffic":  snap.Caps.Traffic,
-			"cellular": snap.Caps.Cellular,
-			"cellinfo": snap.Caps.CellInfo,
-			"reboot":   snap.Caps.Reboot,
+			"sms":         snap.Caps.SMS,
+			"signal":      snap.Caps.Signal,
+			"traffic":     snap.Caps.Traffic,
+			"cellular":    snap.Caps.Cellular,
+			"cellinfo":    snap.Caps.CellInfo,
+			"reboot":      snap.Caps.Reboot,
+			"carrier_agg": snap.Caps.CarrierAgg,
+			"neighbor":    snap.Caps.Neighbor,
+			"lock":        snap.Caps.Lock,
+			"log":         snap.Caps.Log,
+			"data_switch": snap.Caps.DataSwitch,
 		},
 		"has_error": snap.HasError,
 	})

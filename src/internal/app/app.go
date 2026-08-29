@@ -71,6 +71,7 @@ func (s *State) Run(reloadCh <-chan struct{}) error {
 	// 装配 HTTP API（仅回环 127.0.0.1），读缓存不触发 CPE。
 	s.api = httpapi.New(s.log, s.cfg, s.store, s.mgr)
 	s.api.SetDB(s.sqldb)
+	s.api.SetPollers(s.pollersByID())
 
 	// 启动 API 服务（真实监听在 Start 中）。
 	if err := s.api.Start(); err != nil {
@@ -178,6 +179,15 @@ func (s *State) stopPollers() {
 	s.pollers = nil
 }
 
+// pollersByID 返回 device id → poller 的映射（功能 10：httpapi 控制暂停/恢复）。
+func (s *State) pollersByID() map[string]httpapi.PauseController {
+	m := make(map[string]httpapi.PauseController, len(s.pollers))
+	for _, p := range s.pollers {
+		m[p.DeviceID()] = p
+	}
+	return m
+}
+
 // startSMSSyncers 为全部启用设备创建并启动短信同步 goroutine。
 // 数据库未打开（sqldb == nil = 历史/短信存储不可用）时跳过——同步器依赖 SQLite 去重入库。
 func (s *State) startSMSSyncers(ctx context.Context) {
@@ -228,6 +238,7 @@ func (s *State) reload(ctx context.Context) {
 		s.startPollers(ctx)
 		s.stopSMSSyncers()
 		s.startSMSSyncers(ctx)
+		s.api.SetPollers(s.pollersByID())
 	}
 
 	s.log.Info("config reloaded",

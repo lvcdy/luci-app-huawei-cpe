@@ -42,6 +42,13 @@ type SignalState struct {
 	PLMN string // 运营商 PLMN（如 46000）
 	Band string // 服务小区 band（如 "B3"）
 	PCI  int    // 物理小区 ID
+	// 功能 1：小区详情增强字段（net/cell-info 并集）
+	ARFCN     string // 服务小区 ARFCN（earfcn/nrarfcn 并集显示）
+	EARFCN    string // LTE ARFCN（可空）
+	NRARFCN   string // NR ARFCN（可空）
+	Bandwidth int    // 小区带宽 MHz（0 = 未知）
+	CQI       int    // 信道质量指示（0 = 未知）
+	CellID    int64  // 小区标识（0 = 未知）
 }
 
 // NetworkState 是 net/network + net/current-plmn 的类型化解。
@@ -68,13 +75,19 @@ type TrafficState struct {
 }
 
 // Capabilities 是设备能力矩阵（探测一次并缓存；NotSupported → false 后不再调用）。
+// 零值陷阱：布尔零值 = false = “全部禁用”，初始化时必须显式全 true。
 type Capabilities struct {
-	SMS      bool
-	Signal   bool
-	Traffic  bool
-	Cellular bool
-	CellInfo bool
-	Reboot   bool
+	SMS        bool
+	Signal     bool
+	Traffic    bool
+	Cellular   bool
+	CellInfo   bool
+	Reboot     bool
+	CarrierAgg bool // 载波聚合（seccellinfo）
+	Neighbor   bool // 邻小区（nbrcellinfo）
+	Lock       bool // 锁频（celllock/lock-cell）
+	Log        bool // 系统操作日志（log/loginfo）
+	DataSwitch bool // 流量开关（dialup/mobile-dataswitch）
 }
 
 // Snapshot 是一次轮询采集的完整内存快照（不含凭据）。
@@ -86,12 +99,54 @@ type Snapshot struct {
 	Network  NetworkState
 	Traffic  TrafficState
 	Caps     Capabilities
-	HasError bool // 本周期至少有一项采集失败
+	Cell     CellDetail  // 功能 1：服务小区详情
+	Carrier  []CellState // 功能 3：载波聚合（辅小区）
+	Neighbor []CellState // 功能 3：邻小区
+	Lock     LockState   // 功能 5：当前锁频状态
+	Data     DataState   // 功能 6：流量开关
+	Log      []LogEntry  // 功能 4：系统操作日志（最近 N 条）
+	QoS      QoSState    // 功能 2：AMBR / QCI / 速度限制状态
+	HasError bool        // 本周期至少有一项采集失败
+}
+
+// QoSState 是功能 2：AMBR / QCI / 速度限制状态（monitoring/status + net/cell-info）。
+// 0 值 = 未提供/未知（前端显示 “—” 而非误导性数值）。
+type QoSState struct {
+	QCI        int   // QoS 类别标识（mQos/QosPriority；0=未知）
+	DlAmbr     int64 // 下行聚合最大比特率 kbps（0=未知）
+	UlAmbr     int64 // 上行聚合最大比特率 kbps
+	MaxDlSpeed int64 // 速度限制：下行上限 kbps（0=不限速/未知）
+	MaxUlSpeed int64 // 速度限制：上行上限 kbps
+	SpeedLimit bool  // 是否设置了速度限制（任一 Max 速度 > 0）
+}
+
+// LockState 是当前锁频参数（api/ntwk/celllock）。
+type LockState struct {
+	Lock    int    // 0=未锁定 1=已锁定（按频率） 2=按小区
+	Freq    string // 锁定频率（ARFCN）
+	PCI     int    // 锁定 PCI
+	MaxFreq string // 锁定频率上限（部分固件）
+}
+
+// DataState 是移动数据开关状态（api/dialup/mobile-dataswitch）。
+type DataState struct {
+	DataSwitch int // 0=关 1=开（-1=未知/不支持）
+}
+
+// LogEntry 是系统操作日志的一条（api/log/loginfo）。
+type LogEntry struct {
+	Type  string // 日志类型（logtype）
+	Level string // 级别（loglevel，如 INFO/WARN/ERROR）
+	Time  string // 时间（固件格式，原样保留）
+	Info  string // 内容（可能为 base64/编码，前端解码）
 }
 
 // Poller 是单设备的轮询采集器。
 //
 // 并发安全：Last 通过互斥锁读。轮询循环本身串行。
+// 暂停机制（功能 10）：Suspend 置暂停标志并唤醒循环（跳过后续采集周期，
+// 不向 CPE 发请求）；Resume 清标志并立即触发一次采集。
+// 前端页面在后台（失焦）时暂停，前台恢复，降低对 CPE 的请求压力。
 type Poller struct {
 	log  Logger
 	dev  *device.Device
@@ -99,8 +154,11 @@ type Poller struct {
 	stop chan struct{}
 	done chan struct{} // Start 返回时关闭（等待旧循环退出，防止并发采集）
 
-	mu   sync.RWMutex
-	last Snapshot // 最近一次采集快照
+	mu        sync.RWMutex
+	last      Snapshot // 最近一次采集快照
+	suspended bool     // 暂停标志（Start 循环读取）
+
+	notify chan struct{} // 暂停状态变化通知（Start 循环 select 监听）
 
 	// 差分速率状态（仅轮询 goroutine 访问，无需加锁）
 	prevRx int64
@@ -113,19 +171,25 @@ type Poller struct {
 // sink 可为 nil（此时快照仅保留在 Last）。
 func New(log Logger, dev *device.Device, sink Sink) *Poller {
 	return &Poller{
-		log:  log,
-		dev:  dev,
-		sink: sink,
-		stop: make(chan struct{}),
-		done: make(chan struct{}),
+		log:    log,
+		dev:    dev,
+		sink:   sink,
+		stop:   make(chan struct{}),
+		done:   make(chan struct{}),
+		notify: make(chan struct{}, 1),
 		last: Snapshot{
 			Caps: Capabilities{
-				SMS:      true,
-				Signal:   true,
-				Traffic:  true,
-				Cellular: true,
-				CellInfo: true,
-				Reboot:   true,
+				SMS:        true,
+				Signal:     true,
+				Traffic:    true,
+				Cellular:   true,
+				CellInfo:   true,
+				Reboot:     true,
+				CarrierAgg: true,
+				Neighbor:   true,
+				Lock:       true,
+				Log:        true,
+				DataSwitch: true,
 			},
 		},
 	}
@@ -147,6 +211,7 @@ func (p *Poller) Interval() time.Duration {
 
 // Start 启动轮询循环并阻塞直到 ctx 取消或 Stop 被调用。
 // 首次采集立即执行，之后按 Interval 周期执行。返回时 done 被关闭。
+// 暂停时（Suspend）不采集不请求 CPE；Resume 立即触发一次采集并恢复周期。
 func (p *Poller) Start(ctx context.Context) {
 	defer close(p.done)
 	p.log.Info("poller: starting", "dev", p.dev.ID(), "interval", p.Interval().String())
@@ -155,15 +220,77 @@ func (p *Poller) Start(ctx context.Context) {
 
 	p.pollOnce(ctx)
 	for {
+		// 暂停期间：只监听 ctx/stop/notify，不触发采集
+		if p.isSuspended() {
+			select {
+			case <-ctx.Done():
+				return
+			case <-p.stop:
+				return
+			case <-p.notify:
+				// 被唤醒：若仍是暂停（并发 Suspend）继续循环，否则立即采集
+				if !p.isSuspended() {
+					p.pollOnce(ctx)
+				}
+			}
+			continue
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-p.stop:
 			return
+		case <-p.notify:
+			// 状态变化（可能刚被 Suspend/Resume）：回到循环头重新判断
 		case <-ticker.C:
 			p.pollOnce(ctx)
 		}
 	}
+}
+
+// Suspend 暂停轮询（功能 10：后台页面失焦时调用）。
+// 幂等；暂停后循环不再采集也不向 CPE 发请求。
+func (p *Poller) Suspend() {
+	p.mu.Lock()
+	if !p.suspended {
+		p.suspended = true
+		p.wake()
+	}
+	p.mu.Unlock()
+}
+
+// Resume 恢复轮询（功能 10：前台页面聚焦时调用）。
+// 幂等；恢复后立即触发一次采集（唤醒循环）。
+func (p *Poller) Resume() {
+	p.mu.Lock()
+	if p.suspended {
+		p.suspended = false
+		p.wake()
+	}
+	p.mu.Unlock()
+}
+
+// IsSuspended 返回是否处于暂停状态。
+func (p *Poller) IsSuspended() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.suspended
+}
+
+// wake 非阻塞发出状态变化通知（缓冲 1 足够：只有循环在消费）。
+// 调用方必须持有 p.mu。
+func (p *Poller) wake() {
+	select {
+	case p.notify <- struct{}{}:
+	default:
+	}
+}
+
+// isSuspended 不加锁读暂停标志（仅 Start 循环内调用）。
+func (p *Poller) isSuspended() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.suspended
 }
 
 // Stop 请求停止轮询循环（配合 Start 的 ctx 使用，二选一）。
@@ -266,6 +393,54 @@ func (p *Poller) pollOnce(ctx context.Context) {
 			p.handlePollErr("month_statistics", err, &snap)
 		}
 	}
+	// 8. 功能 1：net/cell-info —— 服务小区 RF 详情（ARFCN/带宽/CQI/CellID）
+	if snap.Caps.CellInfo {
+		if ci, err := client.Net.CellInfo(); err == nil {
+			p.fillFromCellInfo(&snap, ci)
+		} else if device.Classify(err) != device.KindUnsupported {
+			p.handlePollErr("cell-info", err, &snap)
+		}
+	}
+	// 9. 功能 3：device/seccellinfo —— 载波聚合辅小区（5G CPE 专有）
+	if snap.Caps.CarrierAgg {
+		if sc, err := client.Device.SecCellInfo(); err == nil {
+			p.fillFromSecCell(&snap, sc)
+		} else if device.Classify(err) != device.KindUnsupported {
+			p.handlePollErr("seccellinfo", err, &snap)
+		}
+	}
+	// 10. 功能 3：device/nbrcellinfo —— 邻小区（5G CPE 专有）
+	if snap.Caps.Neighbor {
+		if nb, err := client.Device.NbrCellInfo(); err == nil {
+			p.fillFromNbrCell(&snap, nb)
+		} else if device.Classify(err) != device.KindUnsupported {
+			p.handlePollErr("nbrcellinfo", err, &snap)
+		}
+	}
+	// 11. 功能 5：api/ntwk/celllock —— 当前锁频参数
+	if snap.Caps.Lock {
+		if lk, err := client.Ntwk.Celllock(); err == nil {
+			p.fillFromCelllock(&snap, lk)
+		} else if device.Classify(err) != device.KindUnsupported {
+			p.handlePollErr("celllock", err, &snap)
+		}
+	}
+	// 12. 功能 6：api/dialup/mobile-dataswitch —— 流量开关
+	if snap.Caps.DataSwitch {
+		if ds, err := client.DialUp.MobileDataswitch(); err == nil {
+			p.fillFromDataSwitch(&snap, ds)
+		} else if device.Classify(err) != device.KindUnsupported {
+			p.handlePollErr("mobile-dataswitch", err, &snap)
+		}
+	}
+	// 13. 功能 4：api/log/loginfo —— 系统操作日志尾部（有界）
+	if snap.Caps.Log {
+		if lg, err := client.Log.Loginfo(); err == nil {
+			snap.Log = parseLogInfo(lg)
+		} else if device.Classify(err) != device.KindUnsupported {
+			p.handlePollErr("loginfo", err, &snap)
+		}
+	}
 
 	p.calcRate(&snap)
 
@@ -289,6 +464,30 @@ func (p *Poller) fillFromStatus(snap *Snapshot, m map[string]any) {
 	snap.Network.CurrentNetworkType = strOr(m, "CurrentNetworkType", snap.Network.CurrentNetworkType)
 	snap.Network.CurrentServiceDomain = strOr(m, "CurrentServiceDomain", snap.Network.CurrentServiceDomain)
 	snap.Network.Roaming = intpOr(m, "Roaming", snap.Network.Roaming)
+	// 功能 2：AMBR / QCI / 速度限制（monitoring/status 直出，键名见 docs/01-sdk-analysis.md）
+	if v, ok := intp(m, "mQos"); ok {
+		snap.QoS.QCI = v
+	} else if v, ok := intp(m, "QosPriority"); ok {
+		snap.QoS.QCI = v
+	}
+	if v, ok := int64p(m, "DownlinkAmbr"); ok {
+		snap.QoS.DlAmbr = v
+	} else if v, ok := int64p(m, "DlAmbr"); ok {
+		snap.QoS.DlAmbr = v
+	}
+	if v, ok := int64p(m, "UplinkAmbr"); ok {
+		snap.QoS.UlAmbr = v
+	} else if v, ok := int64p(m, "UlAmbr"); ok {
+		snap.QoS.UlAmbr = v
+	}
+	// 速度限制（部分固件 net/network 或 status 携带 MaxDownlinkSpeed/MaxUplinkSpeed）
+	if v, ok := int64p(m, "MaxDownlinkSpeed"); ok {
+		snap.QoS.MaxDlSpeed = v
+	}
+	if v, ok := int64p(m, "MaxUplinkSpeed"); ok {
+		snap.QoS.MaxUlSpeed = v
+	}
+	snap.QoS.SpeedLimit = snap.QoS.MaxDlSpeed > 0 || snap.QoS.MaxUlSpeed > 0
 }
 
 // fillFromSignal 解析 device/signal。
@@ -313,6 +512,14 @@ func (p *Poller) fillFromNetwork(snap *Snapshot, m map[string]any) {
 	snap.Network.CurrentNetworkType = strOr(m, "CurrentNetworkType", snap.Network.CurrentNetworkType)
 	snap.Network.CurrentServiceDomain = strOr(m, "CurrentServiceDomain", snap.Network.CurrentServiceDomain)
 	snap.Network.Roaming = intpOr(m, "Roaming", snap.Network.Roaming)
+	// 部分固件的速度限制键在 net/network 而非 monitoring/status
+	if v, ok := int64p(m, "MaxDownlinkSpeed"); ok {
+		snap.QoS.MaxDlSpeed = v
+	}
+	if v, ok := int64p(m, "MaxUplinkSpeed"); ok {
+		snap.QoS.MaxUlSpeed = v
+	}
+	snap.QoS.SpeedLimit = snap.QoS.MaxDlSpeed > 0 || snap.QoS.MaxUlSpeed > 0
 }
 
 // fillFromPlmn 解析 net/current-plmn（根是 <currentplmn> 保留为顶层键，也可能嵌套）。
@@ -354,6 +561,71 @@ func (p *Poller) fillFromTraffic(snap *Snapshot, m map[string]any) {
 	// 备用键：TotalBytes 形态（某些型号）
 	if v, ok := int64p(m, "TotalBytes"); ok && t.TotalRxBytes == 0 {
 		t.TotalRxBytes = v
+	}
+}
+
+// fillFromCellInfo 解析 net/cell-info（功能 1：ARFCN/带宽/CQI/CellID + 功能 2 QCI）。
+func (p *Poller) fillFromCellInfo(snap *Snapshot, m map[string]any) {
+	fillCellFromInfo(&snap.Cell, m)
+	// 若 cell-info 带 pci，回填到 SignalState（部分型号 signal 端点无 pci）
+	if snap.Signal.PCI == 0 && snap.Cell.PCI != 0 {
+		snap.Signal.PCI = snap.Cell.PCI
+	}
+	// 部分固件 cell-info 也带 QCI（qci 键）
+	if v, ok := intp(m, "qci"); ok && snap.QoS.QCI == 0 {
+		snap.QoS.QCI = v
+	}
+}
+
+// fillFromSecCell 解析 device/seccellinfo（功能 3：载波聚合辅小区）。
+func (p *Poller) fillFromSecCell(snap *Snapshot, m map[string]any) {
+	// 优先 5G 列表；回落 4G 列表
+	v := findNestedList(m, "nrseccell_list", "nrseccelllist")
+	if v == "" {
+		v = findNestedList(m, "lteseccell_list", "lteseccelllist")
+	}
+	snap.Carrier = parseCellList(v)
+	if len(snap.Carrier) == 0 {
+		snap.Carrier = nil
+		return
+	}
+	// cell_id 可能作为独立键存在（部分固件在 seccellinfo 根上）
+	if cid, ok := int64p(m, "cell_id"); ok && cid != 0 {
+		for i := range snap.Carrier {
+			if snap.Carrier[i].CellID == 0 {
+				snap.Carrier[i].CellID = cid
+			}
+		}
+	}
+}
+
+// fillFromNbrCell 解析 device/nbrcellinfo（功能 3：邻小区）。
+func (p *Poller) fillFromNbrCell(snap *Snapshot, m map[string]any) {
+	v := findNestedList(m, "nbrcell_nrlist", "nbrcellnrlist")
+	if v == "" {
+		v = findNestedList(m, "nbrcell_ltelist", "nbrcellltelist")
+	}
+	snap.Neighbor = parseCellList(v)
+	if len(snap.Neighbor) == 0 {
+		snap.Neighbor = nil
+	}
+}
+
+// fillFromCelllock 解析 api/ntwk/celllock（功能 5：当前锁频参数）。
+func (p *Poller) fillFromCelllock(snap *Snapshot, m map[string]any) {
+	snap.Lock.Lock = intpOr(m, "Lock", 0)
+	snap.Lock.Freq = strOr(m, "Freq", "")
+	snap.Lock.PCI = intpOr(m, "PCI", 0)
+	snap.Lock.MaxFreq = strOr(m, "MaxFreq", "")
+}
+
+// fillFromDataSwitch 解析 api/dialup/mobile-dataswitch（功能 6：流量开关）。
+// 成功访问但字段缺失 → -1（未知），前端隐藏状态而非误显示为关。
+func (p *Poller) fillFromDataSwitch(snap *Snapshot, m map[string]any) {
+	if v, ok := intp(m, "dataswitch"); ok {
+		snap.Data.DataSwitch = v
+	} else {
+		snap.Data.DataSwitch = -1
 	}
 }
 
@@ -410,6 +682,18 @@ func disableCap(snap *Snapshot, step string) {
 		snap.Caps.Traffic = false
 	case "network", "current-plmn":
 		snap.Caps.Cellular = false
+	case "cell-info":
+		snap.Caps.CellInfo = false
+	case "seccellinfo":
+		snap.Caps.CarrierAgg = false
+	case "nbrcellinfo":
+		snap.Caps.Neighbor = false
+	case "celllock":
+		snap.Caps.Lock = false
+	case "mobile-dataswitch":
+		snap.Caps.DataSwitch = false
+	case "loginfo":
+		snap.Caps.Log = false
 	}
 }
 

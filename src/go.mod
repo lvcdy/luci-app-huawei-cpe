@@ -3,7 +3,7 @@ module huawei-cpe
 go 1.27.0
 
 require (
-	github.com/lvcdy/huawei-lte-api-go v0.0.0-20260828161500-4ad57c43ceea
+	github.com/lvcdy/huawei-lte-api-go v0.0.0-20260829030426-c7ab9066bf4e
 	modernc.org/sqlite v1.57.0
 )
 

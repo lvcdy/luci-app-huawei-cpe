@@ -37,8 +37,11 @@ type MockCPE struct {
 
 	mu       sync.Mutex
 	snaps    map[string]EndpointSnap
-	rawSnaps map[string]string // 原始 XML 端点（优先级高于 snaps，用于嵌套结构如 sms-list）
+	rawSnaps map[string]string                     // 原始 XML 端点（优先级高于 snaps，用于嵌套结构如 sms-list）
 	handlers map[string]func(*http.Request) string // 动态端点（最高优先级；返回 XML body）
+
+	// apiRequests 统计累计 /api/ 请求数（功能 10 暂停测试用）。
+	apiRequests atomic.Int64
 }
 
 // NewMockCPE 构造 mock。username 是期望的登录用户名；登录态初始为未登录。
@@ -86,6 +89,9 @@ func (m *MockCPE) SetLoggedIn(v bool) { m.loggedIn.Store(v) }
 // LoginCount 返回累计 user/login 成功请求次数。
 func (m *MockCPE) LoginCount() int32 { return m.loginCount.Load() }
 
+// APIRequests 返回累计 /api/ 请求总数（含登录与轮询；功能 10 测试用）。
+func (m *MockCPE) APIRequests() int64 { return m.apiRequests.Load() }
+
 // ServeHTTP 实现 http.Handler。
 func (m *MockCPE) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
@@ -101,6 +107,7 @@ func (m *MockCPE) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ep := strings.TrimPrefix(path, "/api/")
+	m.apiRequests.Add(1)
 
 	// 真机行为：每个 API 响应头都回传 CSRF token，SDK 凭此维持登录后队列。
 	w.Header().Set("__RequestVerificationToken", m.Token)

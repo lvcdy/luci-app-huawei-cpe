@@ -49,12 +49,27 @@ func (r *Recorder) PutSnapshot(id string, snap poller.Snapshot) {
 		} else {
 			lteBand = snap.Signal.Band
 		}
+		// 功能 1：小区详情持久化（cell-info 优先，回落到 signal 端点的并集）
+		earfcn := snap.Cell.EARFCN
+		if earfcn == "" {
+			earfcn = snap.Signal.EARFCN
+		}
+		nrarfcn := snap.Cell.NRARFCN
+		if nrarfcn == "" {
+			nrarfcn = snap.Signal.NRARFCN
+		}
+		cellID := snap.Cell.CellID
+		if cellID == 0 {
+			cellID = snap.Signal.CellID
+		}
+		earfcnI, nrarfcnI := atoi64Safe(earfcn), atoi64Safe(nrarfcn)
 		if _, err := r.db.Exec(
 			`INSERT INTO signal_history
-				(device_id, ts, rsrp, rsrq, sinr, rssi, lte_band, nr_band, pci)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				(device_id, ts, rsrp, rsrq, sinr, rssi, lte_band, nr_band, pci, cell_id, earfcn, nrarfcn)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			id, ts, snap.Signal.RSRP, snap.Signal.RSRQ, snap.Signal.SINR,
 			snap.Signal.RSSI, lteBand, nrBand, snap.Signal.PCI,
+			cellID, earfcnI, nrarfcnI,
 		); err != nil && r.log != nil {
 			r.log.Warn("history: write signal", "dev", id, "err", err)
 		}
@@ -80,8 +95,8 @@ type bucket struct {
 }
 
 var signalBuckets = map[string]bucket{
-	"h1":  {3600, 0},      // 最近 1 小时，原始点
-	"d7":  {7 * 86400, 3600},  // 最近 7 天，每小时均值
+	"h1":  {3600, 0},           // 最近 1 小时，原始点
+	"d7":  {7 * 86400, 3600},   // 最近 7 天，每小时均值
 	"d30": {30 * 86400, 86400}, // 最近 30 天，每天均值
 }
 
@@ -89,6 +104,19 @@ var trafficBuckets = map[string]bucket{
 	"d1":  {86400, 0},
 	"d7":  {7 * 86400, 3600},
 	"d30": {30 * 86400, 86400},
+}
+
+// atoi64Safe 容忍解析字符串为 int64；脏值返回 0（不 panic）。
+// 用于把 ARFCN 字符串列（earfcn/nrarfcn）转换为 INTEGER 列写入。
+func atoi64Safe(s string) int64 {
+	var out int64
+	for _, c := range strings.TrimSpace(s) {
+		if c < '0' || c > '9' {
+			return 0
+		}
+		out = out*10 + int64(c-'0')
+	}
+	return out
 }
 
 // SignalPoint 是信号趋势的一个聚合点。

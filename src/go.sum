@@ -8,6 +8,8 @@ github.com/hashicorp/golang-lru/v2 v2.0.7 h1:a+bsQ5rvGLjzHuww6tVxozPZFVghXaHOwFs
 github.com/hashicorp/golang-lru/v2 v2.0.7/go.mod h1:QeFd9opnmA6QUJc5vARoKUSoFhyfM2/ZepoAG6RGpeM=
 github.com/lvcdy/huawei-lte-api-go v0.0.0-20260828161500-4ad57c43ceea h1:WlPbvHM2+OeKsof9grnvSbEJnpJqkUFPPoFlyOPfyx8=
 github.com/lvcdy/huawei-lte-api-go v0.0.0-20260828161500-4ad57c43ceea/go.mod h1:BUUD1d/FpqgrCO4lHwrKtszTu+GEy/TpjRsy9KJnOjk=
+github.com/lvcdy/huawei-lte-api-go v0.0.0-20260829030426-c7ab9066bf4e h1:q8uS6ZogfuoOeffxUJrw42yriCn70pmeAJRjsRkZq4g=
+github.com/lvcdy/huawei-lte-api-go v0.0.0-20260829030426-c7ab9066bf4e/go.mod h1:BUUD1d/FpqgrCO4lHwrKtszTu+GEy/TpjRsy9KJnOjk=
 github.com/mattn/go-isatty v0.0.24 h1:tGZZoVgT/KiqK1c8ocVLeDS8BSWMRd47J3Lbz7vsReI=
 github.com/mattn/go-isatty v0.0.24/go.mod h1:nMCL3Zebbrt45jsMDgnfIwz6ydEQApk5oEI3HqDio6A=
 github.com/ncruces/go-strftime v1.0.0 h1:HMFp8mLCTPp341M/ZnA4qaf7ZlsbTc+miZjCLOFAw7w=
