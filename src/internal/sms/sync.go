@@ -127,7 +127,8 @@ func (s *Syncer) SyncOnce(ctx context.Context) (int, error) {
 	}
 	defer release()
 
-	msgs, err := client.Sms.GetMessages(1, enums.BoxTypeMixInbox, 0,
+	// 用本地收件箱（H168-383 等固件对 BoxTypeMixInbox 返回空，须用本地箱）。
+	msgs, err := client.Sms.GetMessages(1, enums.BoxTypeLocalInbox, 0,
 		enums.SortTypeDate, false, false)
 	if err != nil {
 		switch device.Classify(err) {

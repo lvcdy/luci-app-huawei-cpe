@@ -14,6 +14,7 @@ bin/
 build/
 staging_dir/
 tmp/
+.tmp/
 
 # Editor / OS
 *.swp

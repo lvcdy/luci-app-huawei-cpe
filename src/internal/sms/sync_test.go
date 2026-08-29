@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -63,15 +64,22 @@ func xmlEscape(s string) string {
 }
 
 // mockSmsList 挂载一个按 PageIndex 分页的 sms/sms-list 端点（每页 20 条，模拟 SDK 翻页）。
-func mockSmsList(m *testutil.MockCPE, all []smsMsg) *int {
+// 返回捕获的请求次数与 BoxType 列表（用于验证请求参数）。
+func mockSmsList(m *testutil.MockCPE, all []smsMsg) (*int, *[]int) {
 	// 记录 sms-list 被请求的次数（用于验证禁用后不再请求）
 	var calls int
+	boxTypes := &[]int{}
+	var mu sync.Mutex
 	m.SetEndpointHandler("sms/sms-list", func(r *http.Request) string {
 		calls++
 		var req struct {
 			PageIndex int `xml:"PageIndex"`
+			BoxType   int `xml:"BoxType"`
 		}
 		_ = xml.NewDecoder(r.Body).Decode(&req)
+		mu.Lock()
+		*boxTypes = append(*boxTypes, req.BoxType)
+		mu.Unlock()
 		if req.PageIndex <= 0 {
 			req.PageIndex = 1
 		}
@@ -86,7 +94,7 @@ func mockSmsList(m *testutil.MockCPE, all []smsMsg) *int {
 		}
 		return smsListPage(all[start:end], len(all))
 	})
-	return &calls
+	return &calls, boxTypes
 }
 
 // ---- helpers ----
@@ -131,12 +139,12 @@ func TestSyncOnceInsertsAndDedups(t *testing.T) {
 		{Index: 40, Status: 0, Phone: "+13800138000", Content: "hi from router", Date: "2026-01-02 15:04:05"},
 		{Index: 39, Status: 1, Phone: "10086", Content: "balance 12.3", Date: "2026-01-02 14:00:00"},
 	}
-	mockSmsList(mock, all)
+	_, boxTypes := mockSmsList(mock, all)
 
 	s, srv, sqldb := newTestSyncer(t, mock, 30*time.Second)
 	defer srv.Close()
 
-	// 首次同步：3 条全部新增
+	// 首次同步：2 条全部新增
 	n, err := s.SyncOnce(context.Background())
 	if err != nil {
 		t.Fatalf("first sync: %v", err)
@@ -146,6 +154,11 @@ func TestSyncOnceInsertsAndDedups(t *testing.T) {
 	}
 	if got := countSms(t, sqldb); got != 2 {
 		t.Fatalf("rows after first sync = %d, want 2", got)
+	}
+
+	// 必须用本地收件箱（H168-383 等固件对 MixInbox 返回空）
+	if len(*boxTypes) == 0 || (*boxTypes)[0] != 1 {
+		t.Fatalf("first request BoxType = %v, want [1] (local inbox; MixInbox breaks real devices)", *boxTypes)
 	}
 
 	// 第二次同步（同一批短信）：0 新增 —— 重复同步不重复入库
@@ -163,7 +176,7 @@ func TestSyncOnceInsertsAndDedups(t *testing.T) {
 	// 新增一条再同步：只 +1
 	all = append(all, smsMsg{Index: 41, Status: 0, Phone: "+861391", Content: "new one", Date: "2026-01-02 16:00:00"})
 	// 重新挂载（mock 的 handler 抓的是旧 all 切片）
-	mockSmsList(mock, all)
+	_, _ = mockSmsList(mock, all)
 	n, err = s.SyncOnce(context.Background())
 	if err != nil {
 		t.Fatalf("third sync: %v", err)
@@ -179,7 +192,7 @@ func TestSyncOnceInsertsAndDedups(t *testing.T) {
 // TestSyncOnceParsesFields 验证字段正确入库（不依赖 SDK 语义误读）。
 func TestSyncOnceParsesFields(t *testing.T) {
 	mock := testutil.NewMockCPE("admin")
-	mockSmsList(mock, []smsMsg{
+	_, _ = mockSmsList(mock, []smsMsg{
 		{Index: 7, Status: 0, Phone: "+100", Content: "hello & thanks", Date: "2026-03-04 05:06:07"},
 	})
 
@@ -215,7 +228,7 @@ func TestSyncOnceParsesFields(t *testing.T) {
 // TestSyncOnceEmptyList 验证空列表不报错、不落库。
 func TestSyncOnceEmptyList(t *testing.T) {
 	mock := testutil.NewMockCPE("admin")
-	mockSmsList(mock, nil)
+	_, _ = mockSmsList(mock, nil)
 
 	s, srv, sqldb := newTestSyncer(t, mock, 30*time.Second)
 	defer srv.Close()
@@ -260,7 +273,7 @@ func TestSyncUnsupportedDisablesDevice(t *testing.T) {
 // TestSyncContentNotInError 验证短信正文绝不进入错误文本（切字符串断言）。
 func TestSyncContentNotInError(t *testing.T) {
 	mock := testutil.NewMockCPE("admin")
-	mockSmsList(mock, []smsMsg{
+	_, _ = mockSmsList(mock, []smsMsg{
 		{Index: 1, Status: 0, Phone: "+x", Content: "SECRET-SMS-BODY-12345", Date: "2026-01-01 00:00:00"},
 	})
 	s, srv, _ := newTestSyncer(t, mock, 30*time.Second)
